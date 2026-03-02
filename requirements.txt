@@ -1,3 +1,4 @@
 streamlit
 audio-recorder-streamlit
 google-genai
+supabase
