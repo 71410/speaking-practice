@@ -15,10 +15,7 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 client = genai.Client(api_key=GEMINI_API_KEY)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-USER_DATABASE = {
-    "admin": "123456",       
-    "friend1": "ielts75"
-}
+USER_DATABASE = st.secrets["passwords"]
 
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
@@ -207,3 +204,4 @@ else:
                     st.error(f"发生了一点小意外：{e}")
                     
                 os.remove(tmp_file_path)
+
