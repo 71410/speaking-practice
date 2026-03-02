@@ -50,7 +50,15 @@ else:
         st.sidebar.subheader("⚙️ 管理员后台")
         # 魔法点1：现在允许上传 PDF 了！
         uploaded_file = st.sidebar.file_uploader("📂 智能导入机经 (CSV / PDF)", type=["csv", "pdf"])
-        
+        # 👇 新增：极其危险但好用的“一键清空”核按钮
+        st.sidebar.markdown("---")
+        st.sidebar.subheader("🗑️ 危险操作区")
+        # type="primary" 会让这个按钮变成醒目的红色！
+        if st.sidebar.button("🚨 一键清空所有题库", type="primary"):
+            with st.spinner("正在销毁所有题目..."):
+                # 数据库操作：删除 id 不等于 0 的所有数据（也就是全删）
+                supabase.table("question_bank").delete().neq("id", 0).execute()
+            st.sidebar.success("✅ 题库已彻底清空！请手动刷新网页。")
         if uploaded_file is not None:
             if st.sidebar.button("🚀 启动智能分析与导入"):
                 
@@ -198,3 +206,4 @@ else:
                 st.error(f"发生了一点小意外：{e}")
                 
             os.remove(tmp_file_path)
+
