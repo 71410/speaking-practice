@@ -8,6 +8,7 @@ import os
 import json
 import re  
 from gtts import gTTS
+import io
 
 # --- 1. 🔑 核心配置区 ---
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -289,9 +290,9 @@ else:
             if st.button("🎧 听专业播音员示范"):
                 with st.spinner("正在呼叫播音员..."):
                     tts = gTTS(text=target_text, lang='en', tld='co.uk')
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_tts:
-                        tts.save(tmp_tts.name)
-                        st.audio(tmp_tts.name, format="audio/mp3")
+                    sound_file = io.BytesIO() # 在内存里建个虚拟空间
+                    tts.write_to_fp(sound_file) # 把声音直接写进内存
+                    st.audio(sound_file, format="audio/mp3") # 直接发给手机播放！
 
             reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
             past_reading_records = reading_db_response.data
@@ -365,3 +366,4 @@ else:
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state[reading_key_name] += 1
                     st.rerun()
+
