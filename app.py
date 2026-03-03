@@ -6,7 +6,7 @@ import pandas as pd
 import tempfile
 import os
 import json
-import re  # 🌟 新增：正则表达式模块，用来智能切分句子
+import re  
 from gtts import gTTS
 
 # --- 1. 🔑 核心配置区 ---
@@ -47,7 +47,6 @@ else:
         st.sidebar.subheader("⚙️ 管理员后台")
         upload_target = st.sidebar.radio("🎯 选择导入目标：", ["🗣️ 口语题库", "📖 阅读文章库"])
         
-        # [口语题库导入逻辑保持不变]
         if upload_target == "🗣️ 口语题库":
             uploaded_file = st.sidebar.file_uploader("📂 智能导入口语题 (CSV / PDF)", type=["csv", "pdf"])
             if uploaded_file is not None:
@@ -88,7 +87,6 @@ else:
                             finally:
                                 os.remove(pdf_path)
 
-        # [阅读文章库导入逻辑保持不变]
         elif upload_target == "📖 阅读文章库":
             input_method = st.sidebar.radio("📥 录入方式：", ["📁 文件上传", "✍️ 手动粘贴文本"])
             if input_method == "📁 文件上传":
@@ -162,7 +160,7 @@ else:
     tab_qa, tab_reading = st.tabs(["🗣️ 雅思口语问答", "📖 英文原版朗读纠音"])
     
     # ==========================================
-    # 模块一：口语问答 (保持不变)
+    # 模块一：口语问答 
     # ==========================================
     with tab_qa:
         db_questions = supabase.table("question_bank").select("*").execute()
@@ -197,39 +195,64 @@ else:
 
             st.write("---")
             st.subheader("🗣️ Step 2: 你的回答")
-            audio_bytes_qa = audio_recorder(text="点击麦克风开始作答", icon_size="2x", key="recorder_qa")
+            
+            # 👑 核心修复：引入计步器强制刷新组件
+            qa_key_name = f"counter_{question}"
+            if qa_key_name not in st.session_state:
+                st.session_state[qa_key_name] = 0
+                
+            audio_bytes_qa = audio_recorder(
+                text="点击麦克风开始作答", 
+                icon_size="2x", 
+                key=f"recorder_qa_{question}_{st.session_state[qa_key_name]}"
+            )
 
             if audio_bytes_qa:
                 st.audio(audio_bytes_qa, format="audio/wav")
-                with st.spinner("🧠 考官正在仔细聆听并评估..."):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                        tmp_file.write(audio_bytes_qa)
-                        tmp_file_path = tmp_file.name
-                    try:
-                        audio_file = client.files.upload(file=tmp_file_path)
-                        prompt = f"""
-                        你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
-                        请你：
-                        1. 【精准听写】：写下听到的英文原话。
-                        2. 【切题度与雅思预估分】：评价是否切题，给出预估分数。
-                        3. 【纠错与升级】：给出 2 个针对这道题的高阶示范回答。
-                        4. 【考官建议】：用中文给一段备考建议。
-                        """
-                        response = client.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
-                        st.success("🎉 考官点评完成！")
-                        st.markdown(response.text)
-                        
-                        supabase.table("practice_history").insert({
-                            "username": current_user,
-                            "question": question,
-                            "record_text": response.text
-                        }).execute()
-                    except Exception as e:
-                        st.error(f"发生小意外：{e}")
-                    os.remove(tmp_file_path)
+                
+                # 🛡️ 状态阻断：确保同一段音频只发给大模型一次
+                last_audio_tracker_qa = f"last_audio_{question}"
+                if st.session_state.get(last_audio_tracker_qa) != audio_bytes_qa:
+                    
+                    with st.spinner("🧠 考官正在仔细聆听并评估..."):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                            tmp_file.write(audio_bytes_qa)
+                            tmp_file_path = tmp_file.name
+                        try:
+                            audio_file = client.files.upload(file=tmp_file_path)
+                            prompt = f"""
+                            你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
+                            请你：
+                            1. 【精准听写】：写下听到的英文原话。
+                            2. 【切题度与雅思预估分】：评价是否切题，给出预估分数。
+                            3. 【纠错与升级】：给出 2 个针对这道题的高阶示范回答。
+                            4. 【考官建议】：用中文给一段备考建议。
+                            """
+                            response = client.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
+                            st.success("🎉 考官点评完成！")
+                            st.markdown(response.text)
+                            
+                            supabase.table("practice_history").insert({
+                                "username": current_user,
+                                "question": question,
+                                "record_text": response.text
+                            }).execute()
+                            
+                            # 记录已处理，阻断下次重发
+                            st.session_state[last_audio_tracker_qa] = audio_bytes_qa
+                            
+                        except Exception as e:
+                            st.error(f"发生小意外：{e}")
+                        os.remove(tmp_file_path)
+
+                # 💡 新增：重生按钮
+                st.markdown("---")
+                if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
+                    st.session_state[qa_key_name] += 1
+                    st.rerun()
 
     # ==========================================
-    # 模块二：英文原版朗读纠音 (👑 支持全文/逐句双模式)
+    # 模块二：英文原版朗读纠音 (👑 同样加入强制重生与阻断机制)
     # ==========================================
     with tab_reading:
         db_readings = supabase.table("reading_bank").select("*").execute()
@@ -241,38 +264,28 @@ else:
             reading_title = st.selectbox("📂 选择朗读材料：", list(READING_MATERIALS.keys()), key="sel_reading")
             reading_text = READING_MATERIALS[reading_title]
             
-            # 🌟 核心升级：训练模式切换开关
             practice_mode = st.radio("🎯 选择训练模式：", ["📖 全文连读", "🔍 逐句精读 (推荐)"], horizontal=True)
-            
             st.write("---")
             
-            # 根据模式决定当前要处理的文本 (target_text) 和存入数据库的标题 (db_save_title)
             if practice_mode == "📖 全文连读":
                 target_text = reading_text
                 db_save_title = reading_title
                 st.markdown(f"**请仔细朗读以下完整段落：**\n> ### {target_text}")
                 
             else:
-                # 逐句精读模式：用正则表达式按标点符号切分句子
-                # (?<=[.!?]) 表示在句号、叹号、问号后面切开，保留这些标点
                 raw_sentences = re.split(r'(?<=[.!?])\s+', reading_text)
                 sentences = [s.strip() for s in raw_sentences if s.strip()]
-                
-                if not sentences: # 防御机制：如果文章没标点
-                    sentences = [reading_text]
+                if not sentences: sentences = [reading_text]
                     
                 sentence_idx = st.selectbox(
                     "📍 选择要攻克的句子：", 
                     range(len(sentences)), 
                     format_func=lambda x: f"第 {x+1} 句: {sentences[x][:40]}..."
                 )
-                
                 target_text = sentences[sentence_idx]
                 db_save_title = f"{reading_title} (第{sentence_idx+1}句)"
-                
                 st.markdown(f"**请仔细朗读当前句子（第 {sentence_idx+1}/{len(sentences)} 句）：**\n> ### {target_text}")
             
-            # 🎧 播音员功能 (动态适配全文或单句)
             if st.button("🎧 听专业播音员示范"):
                 with st.spinner("正在呼叫播音员..."):
                     tts = gTTS(text=target_text, lang='en', tld='co.uk')
@@ -280,7 +293,6 @@ else:
                         tts.save(tmp_tts.name)
                         st.audio(tmp_tts.name, format="audio/mp3")
 
-            # 📖 读取历史记录 (动态适配全文或单句)
             reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
             past_reading_records = reading_db_response.data
             
@@ -293,40 +305,63 @@ else:
 
             st.write("---")
             st.subheader("🎙️ 轮到你了")
-            # 动态生成麦克风组件的 key，防止切换句子时录音缓存冲突
-            audio_bytes_reading = audio_recorder(text="点击录制你的朗读", icon_size="2x", key=f"recorder_reading_{db_save_title}")
+            
+            # 👑 核心修复：引入计步器强制刷新组件
+            reading_key_name = f"counter_{db_save_title}"
+            if reading_key_name not in st.session_state:
+                st.session_state[reading_key_name] = 0
+                
+            audio_bytes_reading = audio_recorder(
+                text="点击录制你的朗读", 
+                icon_size="2x", 
+                key=f"recorder_reading_{db_save_title}_{st.session_state[reading_key_name]}"
+            )
 
             if audio_bytes_reading:
                 st.audio(audio_bytes_reading, format="audio/wav")
-                with st.spinner("🧠 流利度教练正在评估你的发音与节奏..."):
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                        tmp_file.write(audio_bytes_reading)
-                        tmp_file_path = tmp_file.name
-                    try:
-                        audio_file = client.files.upload(file=tmp_file_path)
-                        
-                        # 👑 雅思实战流利度专属指令 (包容口音，严抓节奏)
-                        prompt = f"""
-                        你现在是一名从业多年的雅思口语考官，现在充当口语教练。学生正在朗读这段指定的文本：“{target_text}”
-                        我已经上传了学生的录音。
-                        你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判。
-                        请严格按以下格式输出反馈：
-                        1. 【流利度与节奏】：评价朗读时的语速、停顿是否合理，有无不自然的卡顿、结巴或频繁的自我纠正。
-                        2. 【发音准确度（错词/漏词）】：精准指出他严重读错、漏读或多读的具体单词。
-                        3. 【语音语调（重音与连读）】：评价考生的句子意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然，是否具备英语母语者的语感。
-                        4. 【考官提分建议】：给出一段犀利且实用的综合提升建议，帮助考生在雅思实战中听起来更自然、更自信。
-                        """
-                        response = client.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
-                        st.success("🎉 发音诊断报告已生成！")
-                        st.markdown(response.text)
-                        st.balloons()
-                        
-                        # 保存记录到数据库
-                        supabase.table("reading_history").insert({
-                            "username": current_user,
-                            "reading_title": db_save_title,
-                            "record_text": response.text
-                        }).execute()
-                    except Exception as e:
-                        st.error(f"发生小意外：{e}")
-                    os.remove(tmp_file_path)
+                
+                # 🛡️ 状态阻断：防重复提交
+                last_audio_tracker_reading = f"last_audio_{db_save_title}"
+                if st.session_state.get(last_audio_tracker_reading) != audio_bytes_reading:
+                    
+                    with st.spinner("🧠 流利度教练正在评估你的发音与节奏..."):
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+                            tmp_file.write(audio_bytes_reading)
+                            tmp_file_path = tmp_file.name
+                        try:
+                            audio_file = client.files.upload(file=tmp_file_path)
+                            
+                            prompt = f"""
+                            你现在是一名雅思口语考官兼流利度教练。考生正在朗读这段指定的文本：“{target_text}”
+                            我已经上传了考生的录音。
+                            请注意：**绝对不要纠结考生的口音是英式还是美式**，只要发音清晰即可。你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判。
+                            请严格按以下格式输出反馈：
+                            1. 【流利度与节奏】：评价朗读时的语速、停顿是否合理，有无不自然的卡顿、结巴或频繁的自我纠正。
+                            2. 【发音准确度（错词/漏词）】：精准指出他严重读错、漏读或多读的具体单词。
+                            3. 【语音语调（重音与连读）】：评价考生的句子意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然，是否具备英语母语者的语感。
+                            4. 【考官提分建议】：给出一段犀利且实用的综合提升建议并且给这段阅读打分，帮助考生在雅思实战中听起来更自然、更自信。
+                            """
+                            
+                            response = client.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
+                            st.success("🎉 发音诊断报告已生成！")
+                            st.markdown(response.text)
+                            st.balloons()
+                            
+                            supabase.table("reading_history").insert({
+                                "username": current_user,
+                                "reading_title": db_save_title,
+                                "record_text": response.text
+                            }).execute()
+                            
+                            # 记录已处理
+                            st.session_state[last_audio_tracker_reading] = audio_bytes_reading
+                            
+                        except Exception as e:
+                            st.error(f"发生小意外：{e}")
+                        os.remove(tmp_file_path)
+
+                # 💡 新增：重生按钮
+                st.markdown("---")
+                if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
+                    st.session_state[reading_key_name] += 1
+                    st.rerun()
