@@ -6,6 +6,7 @@ import pandas as pd
 import tempfile
 import os
 import json
+import re  # 🌟 新增：正则表达式模块，用来智能切分句子
 from gtts import gTTS
 
 # --- 1. 🔑 核心配置区 ---
@@ -40,16 +41,13 @@ else:
     current_user = st.session_state.current_user
     st.sidebar.write(f"👤 当前练习者：**{current_user}**")
     
-    # --- 👑 终极版管理员后台：支持文件与纯文本双通道导入 ---
+    # --- 👑 管理员后台 ---
     if current_user == "admin":
         st.sidebar.markdown("---")
         st.sidebar.subheader("⚙️ 管理员后台")
-        
         upload_target = st.sidebar.radio("🎯 选择导入目标：", ["🗣️ 口语题库", "📖 阅读文章库"])
         
-        # ==========================
-        # 分支 A：导入【口语题库】(保持文件上传)
-        # ==========================
+        # [口语题库导入逻辑保持不变]
         if upload_target == "🗣️ 口语题库":
             uploaded_file = st.sidebar.file_uploader("📂 智能导入口语题 (CSV / PDF)", type=["csv", "pdf"])
             if uploaded_file is not None:
@@ -64,7 +62,6 @@ else:
                                     "question_text": str(row["question"])
                                 }).execute()
                         st.sidebar.success("✅ 口语 CSV 导入成功！")
-                    
                     elif uploaded_file.name.endswith('.pdf'):
                         with st.spinner("🤖 正在召唤大脑提取口语题目..."):
                             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
@@ -72,16 +69,13 @@ else:
                                 pdf_path = tmp_pdf.name
                             try:
                                 pdf_file = client.files.upload(file=pdf_path)
-                                prompt = """
-                                提取雅思口语题目，返回 JSON 数组。键名："part", "theme", "question"。只输出纯文本 JSON。
-                                """
+                                prompt = "提取雅思口语题目，返回 JSON 数组。键名：\"part\", \"theme\", \"question\"。只输出纯文本 JSON。"
                                 response = client.models.generate_content(model='gemini-2.5-flash', contents=[pdf_file, prompt])
                                 raw_text = response.text.strip()
                                 if raw_text.startswith("```json"): raw_text = raw_text[7:]
                                 if raw_text.startswith("```"): raw_text = raw_text[3:]
                                 if raw_text.endswith("```"): raw_text = raw_text[:-3]
                                 extracted_data = json.loads(raw_text.strip())
-                                
                                 for item in extracted_data:
                                     supabase.table("question_bank").insert({
                                         "part": str(item.get("part", "未分类")),
@@ -94,13 +88,9 @@ else:
                             finally:
                                 os.remove(pdf_path)
 
-        # ==========================
-        # 分支 B：导入【阅读文章库】(增加手机端极其友好的纯文本通道！)
-        # ==========================
+        # [阅读文章库导入逻辑保持不变]
         elif upload_target == "📖 阅读文章库":
             input_method = st.sidebar.radio("📥 录入方式：", ["📁 文件上传", "✍️ 手动粘贴文本"])
-            
-            # 情况 1：传统的批量传文件
             if input_method == "📁 文件上传":
                 uploaded_file = st.sidebar.file_uploader("📂 导入阅读文章 (CSV / PDF)", type=["csv", "pdf"])
                 if uploaded_file is not None:
@@ -114,7 +104,6 @@ else:
                                         "content": str(row["content"])
                                     }).execute()
                             st.sidebar.success("✅ 阅读 CSV 导入成功！")
-                        
                         elif uploaded_file.name.endswith('.pdf'):
                             with st.spinner("🤖 正在召唤大脑拆解阅读文章..."):
                                 with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
@@ -122,20 +111,13 @@ else:
                                     pdf_path = tmp_pdf.name
                                 try:
                                     pdf_file = client.files.upload(file=pdf_path)
-                                    prompt = """
-                                    你是一个数据提取程序。请从这份 PDF 中提取出适合英语朗读的段落或文章。
-                                    请严格以 JSON 数组返回。每个元素包含两个键：
-                                    "title"（文章或段落的标题/概括）
-                                    "content"（具体的英文原文正文）。
-                                    只输出纯文本 JSON，绝对不要包含 ```json 标记。
-                                    """
+                                    prompt = "提取适合英语朗读的段落或文章，返回 JSON 数组。键名：\"title\", \"content\"。只输出纯文本 JSON。"
                                     response = client.models.generate_content(model='gemini-2.5-flash', contents=[pdf_file, prompt])
                                     raw_text = response.text.strip()
                                     if raw_text.startswith("```json"): raw_text = raw_text[7:]
                                     if raw_text.startswith("```"): raw_text = raw_text[3:]
                                     if raw_text.endswith("```"): raw_text = raw_text[:-3]
                                     extracted_data = json.loads(raw_text.strip())
-                                    
                                     for item in extracted_data:
                                         supabase.table("reading_bank").insert({
                                             "title": str(item.get("title", "未命名文章")),
@@ -146,13 +128,9 @@ else:
                                     st.sidebar.error(f"解析短路：{e}")
                                 finally:
                                     os.remove(pdf_path)
-
-            # 情况 2：极其轻量、适合手机端的直接粘贴法
             elif input_method == "✍️ 手动粘贴文本":
-                manual_title = st.sidebar.text_input("🏷️ 文章标题 (如: 经济学人每日晨读)")
-                # height=250 让输入框在手机上也有足够的高度方便检查文本
+                manual_title = st.sidebar.text_input("🏷️ 文章标题")
                 manual_content = st.sidebar.text_area("📝 文章正文 (直接在这里粘贴纯英文段落)", height=250)
-                
                 if st.sidebar.button("🚀 闪电保存至数据库", type="primary"):
                     if manual_title.strip() and manual_content.strip():
                         with st.spinner("正在安全归档..."):
@@ -160,7 +138,7 @@ else:
                                 "title": manual_title.strip(),
                                 "content": manual_content.strip()
                             }).execute()
-                        st.sidebar.success(f"✅ 《{manual_title}》已成功存入你的阅读库！刷新网页即可朗读。")
+                        st.sidebar.success(f"✅ 《{manual_title}》已成功存入！")
                     else:
                         st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
@@ -181,10 +159,10 @@ else:
 
     st.title(f"专属英语训练舱 🚀")
     
-    tab_qa, tab_reading = st.tabs(["🗣️ 雅思口语问答", "📖 英式朗读纠音"])
+    tab_qa, tab_reading = st.tabs(["🗣️ 雅思口语问答", "📖 英文原版朗读纠音"])
     
     # ==========================================
-    # 模块一：口语问答 
+    # 模块一：口语问答 (保持不变)
     # ==========================================
     with tab_qa:
         db_questions = supabase.table("question_bank").select("*").execute()
@@ -251,34 +229,63 @@ else:
                     os.remove(tmp_file_path)
 
     # ==========================================
-    # 模块二：英式朗读纠音
+    # 模块二：英文原版朗读纠音 (👑 支持全文/逐句双模式)
     # ==========================================
     with tab_reading:
-        st.subheader("📖 英文原版朗读纠音")
-        
         db_readings = supabase.table("reading_bank").select("*").execute()
         READING_MATERIALS = {row["title"]: row["content"] for row in db_readings.data}
         
         if not READING_MATERIALS:
-            st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏选择【📖 阅读文章库】上传或粘贴文本。")
+            st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏上传或粘贴文本。")
         else:
             reading_title = st.selectbox("📂 选择朗读材料：", list(READING_MATERIALS.keys()), key="sel_reading")
             reading_text = READING_MATERIALS[reading_title]
             
-            st.markdown(f"**请仔细朗读以下段落：**\n> ### {reading_text}")
+            # 🌟 核心升级：训练模式切换开关
+            practice_mode = st.radio("🎯 选择训练模式：", ["📖 全文连读", "🔍 逐句精读 (推荐)"], horizontal=True)
             
-            if st.button("🎧 听专业英式播音员朗读"):
-                with st.spinner("正在呼叫伦敦总部的播音员..."):
-                    tts = gTTS(text=reading_text, lang='en', tld='co.uk')
+            st.write("---")
+            
+            # 根据模式决定当前要处理的文本 (target_text) 和存入数据库的标题 (db_save_title)
+            if practice_mode == "📖 全文连读":
+                target_text = reading_text
+                db_save_title = reading_title
+                st.markdown(f"**请仔细朗读以下完整段落：**\n> ### {target_text}")
+                
+            else:
+                # 逐句精读模式：用正则表达式按标点符号切分句子
+                # (?<=[.!?]) 表示在句号、叹号、问号后面切开，保留这些标点
+                raw_sentences = re.split(r'(?<=[.!?])\s+', reading_text)
+                sentences = [s.strip() for s in raw_sentences if s.strip()]
+                
+                if not sentences: # 防御机制：如果文章没标点
+                    sentences = [reading_text]
+                    
+                sentence_idx = st.selectbox(
+                    "📍 选择要攻克的句子：", 
+                    range(len(sentences)), 
+                    format_func=lambda x: f"第 {x+1} 句: {sentences[x][:40]}..."
+                )
+                
+                target_text = sentences[sentence_idx]
+                db_save_title = f"{reading_title} (第{sentence_idx+1}句)"
+                
+                st.markdown(f"**请仔细朗读当前句子（第 {sentence_idx+1}/{len(sentences)} 句）：**\n> ### {target_text}")
+            
+            # 🎧 播音员功能 (动态适配全文或单句)
+            if st.button("🎧 听专业播音员示范"):
+                with st.spinner("正在呼叫播音员..."):
+                    tts = gTTS(text=target_text, lang='en', tld='co.uk')
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_tts:
                         tts.save(tmp_tts.name)
                         st.audio(tmp_tts.name, format="audio/mp3")
 
-            reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", reading_title).execute()
+            # 📖 读取历史记录 (动态适配全文或单句)
+            reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
             past_reading_records = reading_db_response.data
             
             if len(past_reading_records) > 0:
-                with st.expander(f"📖 查看这篇短文的 {len(past_reading_records)} 次历史纠音记录"):
+                with st.expander(f"📖 查看此项的 {len(past_reading_records)} 次历史纠音记录"):
                     for i, record in enumerate(past_reading_records):
                         st.markdown(f"**▶ 第 {i+1} 次跟读：**")
                         st.write(record["record_text"])
@@ -286,20 +293,23 @@ else:
 
             st.write("---")
             st.subheader("🎙️ 轮到你了")
-            audio_bytes_reading = audio_recorder(text="点击录制你的朗读", icon_size="2x", key="recorder_reading")
+            # 动态生成麦克风组件的 key，防止切换句子时录音缓存冲突
+            audio_bytes_reading = audio_recorder(text="点击录制你的朗读", icon_size="2x", key=f"recorder_reading_{db_save_title}")
 
             if audio_bytes_reading:
                 st.audio(audio_bytes_reading, format="audio/wav")
-                with st.spinner("🧠 纠音导师正在逐字核对你的发音..."):
+                with st.spinner("🧠 流利度教练正在评估你的发音与节奏..."):
                     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
                         tmp_file.write(audio_bytes_reading)
                         tmp_file_path = tmp_file.name
                     try:
                         audio_file = client.files.upload(file=tmp_file_path)
+                        
+                        # 👑 雅思实战流利度专属指令 (包容口音，严抓节奏)
                         prompt = f"""
-                        你现在是一名雅思口语从业多年的考官，现在充当口语教练。学生正在朗读这段指定的文本：“{reading_text}”
+                        你现在是一名从业多年的雅思口语考官，现在充当口语教练。学生正在朗读这段指定的文本：“{target_text}”
                         我已经上传了学生的录音。
-                        请注意：**绝对不要纠结学生的口音是英式还是美式**，只要发音清晰即可。你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判并且打分。
+                        你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判。
                         请严格按以下格式输出反馈：
                         1. 【流利度与节奏】：评价朗读时的语速、停顿是否合理，有无不自然的卡顿、结巴或频繁的自我纠正。
                         2. 【发音准确度（错词/漏词）】：精准指出他严重读错、漏读或多读的具体单词。
@@ -311,13 +321,12 @@ else:
                         st.markdown(response.text)
                         st.balloons()
                         
+                        # 保存记录到数据库
                         supabase.table("reading_history").insert({
                             "username": current_user,
-                            "reading_title": reading_title,
+                            "reading_title": db_save_title,
                             "record_text": response.text
                         }).execute()
                     except Exception as e:
                         st.error(f"发生小意外：{e}")
                     os.remove(tmp_file_path)
-
-
