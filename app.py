@@ -292,6 +292,7 @@ else:
                     tts = gTTS(text=target_text, lang='en', tld='co.uk')
                     sound_file = io.BytesIO() # 在内存里建个虚拟空间
                     tts.write_to_fp(sound_file) # 把声音直接写进内存
+                    sound_file.seek(0) # 👈 新增这句！极其关键的“倒带”操作！
                     st.audio(sound_file, format="audio/mp3") # 直接发给手机播放！
 
             reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
@@ -366,4 +367,5 @@ else:
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state[reading_key_name] += 1
                     st.rerun()
+
 
