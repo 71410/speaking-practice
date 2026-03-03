@@ -9,6 +9,7 @@ import json
 import re  
 from gtts import gTTS
 import io
+import base64
 
 # --- 1. 🔑 核心配置区 ---
 GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
@@ -290,10 +291,19 @@ else:
             if st.button("🎧 听专业播音员示范"):
                 with st.spinner("正在呼叫播音员..."):
                     tts = gTTS(text=target_text, lang='en', tld='co.uk')
-                    sound_file = io.BytesIO() # 在内存里建个虚拟空间
-                    tts.write_to_fp(sound_file) # 把声音直接写进内存
-                    sound_file.seek(0) # 👈 新增这句！极其关键的“倒带”操作！
-                    st.audio(sound_file, format="audio/mp3") # 直接发给手机播放！
+                    sound_file = io.BytesIO()
+                    tts.write_to_fp(sound_file)
+                    sound_file.seek(0)
+                    
+                    # 🚀 针对手机浏览器的终极魔法：Base64 暴力注入
+                    b64 = base64.b64encode(sound_file.read()).decode()
+                    md = f"""
+                        <audio controls autoplay style="width: 100%;">
+                        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
+                        您的浏览器不支持音频播放。
+                        </audio>
+                        """
+                    st.markdown(md, unsafe_allow_html=True)
 
             reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
             past_reading_records = reading_db_response.data
@@ -367,5 +377,6 @@ else:
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state[reading_key_name] += 1
                     st.rerun()
+
 
 
