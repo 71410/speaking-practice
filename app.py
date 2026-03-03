@@ -152,6 +152,7 @@ else:
                                             {"role": "user", "content": prompt}
                                         ],
                                         temperature=0.1
+                                        max_tokens=8192  # 👈 新增这行！给它最大的肺活量！
                                     )
                                     
                                     raw_text = response.choices[0].message.content.strip()
@@ -402,4 +403,5 @@ else:
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state[reading_key_name] += 1
                     st.rerun()
+
 
