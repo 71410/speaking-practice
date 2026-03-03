@@ -40,22 +40,20 @@ else:
     current_user = st.session_state.current_user
     st.sidebar.write(f"👤 当前练习者：**{current_user}**")
     
-    # --- 👑 终极版管理员后台：支持分发双题库 ---
+    # --- 👑 终极版管理员后台：支持文件与纯文本双通道导入 ---
     if current_user == "admin":
         st.sidebar.markdown("---")
         st.sidebar.subheader("⚙️ 管理员后台")
         
-        # 核心升级：增加上传目标选择器
         upload_target = st.sidebar.radio("🎯 选择导入目标：", ["🗣️ 口语题库", "📖 阅读文章库"])
-        uploaded_file = st.sidebar.file_uploader("📂 智能导入 (CSV / PDF)", type=["csv", "pdf"])
         
-        if uploaded_file is not None:
-            if st.sidebar.button("🚀 启动智能分析与导入"):
-                
-                # ==========================
-                # 分支 A：导入【口语题库】
-                # ==========================
-                if upload_target == "🗣️ 口语题库":
+        # ==========================
+        # 分支 A：导入【口语题库】(保持文件上传)
+        # ==========================
+        if upload_target == "🗣️ 口语题库":
+            uploaded_file = st.sidebar.file_uploader("📂 智能导入口语题 (CSV / PDF)", type=["csv", "pdf"])
+            if uploaded_file is not None:
+                if st.sidebar.button("🚀 启动智能分析与导入"):
                     if uploaded_file.name.endswith('.csv'):
                         with st.spinner("正在写入口语表格..."):
                             df = pd.read_csv(uploaded_file)
@@ -96,51 +94,75 @@ else:
                             finally:
                                 os.remove(pdf_path)
 
-                # ==========================
-                # 分支 B：导入【阅读文章库】
-                # ==========================
-                elif upload_target == "📖 阅读文章库":
-                    if uploaded_file.name.endswith('.csv'):
-                        with st.spinner("正在写入阅读表格... (请确保表头是 title 和 content)"):
-                            df = pd.read_csv(uploaded_file)
-                            for index, row in df.iterrows():
-                                supabase.table("reading_bank").insert({
-                                    "title": str(row["title"]),
-                                    "content": str(row["content"])
-                                }).execute()
-                        st.sidebar.success("✅ 阅读 CSV 导入成功！")
-                    
-                    elif uploaded_file.name.endswith('.pdf'):
-                        with st.spinner("🤖 正在召唤大脑拆解阅读文章..."):
-                            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                                tmp_pdf.write(uploaded_file.read())
-                                pdf_path = tmp_pdf.name
-                            try:
-                                pdf_file = client.files.upload(file=pdf_path)
-                                prompt = """
-                                你是一个数据提取程序。请从这份 PDF 中提取出适合英语朗读的段落或文章。
-                                请严格以 JSON 数组返回。每个元素包含两个键：
-                                "title"（文章或段落的标题/概括）
-                                "content"（具体的英文原文正文）。
-                                只输出纯文本 JSON，绝对不要包含 ```json 标记。
-                                """
-                                response = client.models.generate_content(model='gemini-2.5-flash', contents=[pdf_file, prompt])
-                                raw_text = response.text.strip()
-                                if raw_text.startswith("```json"): raw_text = raw_text[7:]
-                                if raw_text.startswith("```"): raw_text = raw_text[3:]
-                                if raw_text.endswith("```"): raw_text = raw_text[:-3]
-                                extracted_data = json.loads(raw_text.strip())
-                                
-                                for item in extracted_data:
+        # ==========================
+        # 分支 B：导入【阅读文章库】(增加手机端极其友好的纯文本通道！)
+        # ==========================
+        elif upload_target == "📖 阅读文章库":
+            input_method = st.sidebar.radio("📥 录入方式：", ["📁 文件上传", "✍️ 手动粘贴文本"])
+            
+            # 情况 1：传统的批量传文件
+            if input_method == "📁 文件上传":
+                uploaded_file = st.sidebar.file_uploader("📂 导入阅读文章 (CSV / PDF)", type=["csv", "pdf"])
+                if uploaded_file is not None:
+                    if st.sidebar.button("🚀 启动智能分析与导入"):
+                        if uploaded_file.name.endswith('.csv'):
+                            with st.spinner("正在写入阅读表格..."):
+                                df = pd.read_csv(uploaded_file)
+                                for index, row in df.iterrows():
                                     supabase.table("reading_bank").insert({
-                                        "title": str(item.get("title", "未命名文章")),
-                                        "content": str(item.get("content", "内容提取失败"))
+                                        "title": str(row["title"]),
+                                        "content": str(row["content"])
                                     }).execute()
-                                st.sidebar.success(f"✅ 成功导入 {len(extracted_data)} 篇阅读文章！")
-                            except Exception as e:
-                                st.sidebar.error(f"解析短路：{e}")
-                            finally:
-                                os.remove(pdf_path)
+                            st.sidebar.success("✅ 阅读 CSV 导入成功！")
+                        
+                        elif uploaded_file.name.endswith('.pdf'):
+                            with st.spinner("🤖 正在召唤大脑拆解阅读文章..."):
+                                with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
+                                    tmp_pdf.write(uploaded_file.read())
+                                    pdf_path = tmp_pdf.name
+                                try:
+                                    pdf_file = client.files.upload(file=pdf_path)
+                                    prompt = """
+                                    你是一个数据提取程序。请从这份 PDF 中提取出适合英语朗读的段落或文章。
+                                    请严格以 JSON 数组返回。每个元素包含两个键：
+                                    "title"（文章或段落的标题/概括）
+                                    "content"（具体的英文原文正文）。
+                                    只输出纯文本 JSON，绝对不要包含 ```json 标记。
+                                    """
+                                    response = client.models.generate_content(model='gemini-2.5-flash', contents=[pdf_file, prompt])
+                                    raw_text = response.text.strip()
+                                    if raw_text.startswith("```json"): raw_text = raw_text[7:]
+                                    if raw_text.startswith("```"): raw_text = raw_text[3:]
+                                    if raw_text.endswith("```"): raw_text = raw_text[:-3]
+                                    extracted_data = json.loads(raw_text.strip())
+                                    
+                                    for item in extracted_data:
+                                        supabase.table("reading_bank").insert({
+                                            "title": str(item.get("title", "未命名文章")),
+                                            "content": str(item.get("content", "内容提取失败"))
+                                        }).execute()
+                                    st.sidebar.success(f"✅ 成功导入 {len(extracted_data)} 篇阅读文章！")
+                                except Exception as e:
+                                    st.sidebar.error(f"解析短路：{e}")
+                                finally:
+                                    os.remove(pdf_path)
+
+            # 情况 2：极其轻量、适合手机端的直接粘贴法
+            elif input_method == "✍️ 手动粘贴文本":
+                manual_title = st.sidebar.text_input("🏷️ 文章标题 (如: 经济学人每日晨读)")
+                # height=250 让输入框在手机上也有足够的高度方便检查文本
+                manual_content = st.sidebar.text_area("📝 文章正文 (直接在这里粘贴纯英文段落)", height=250)
+                
+                if st.sidebar.button("🚀 闪电保存至数据库", type="primary"):
+                    if manual_title.strip() and manual_content.strip():
+                        with st.spinner("正在安全归档..."):
+                            supabase.table("reading_bank").insert({
+                                "title": manual_title.strip(),
+                                "content": manual_content.strip()
+                            }).execute()
+                        st.sidebar.success(f"✅ 《{manual_title}》已成功存入你的阅读库！刷新网页即可朗读。")
+                    else:
+                        st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
         st.sidebar.markdown("---")
         st.sidebar.subheader("🗑️ 危险操作区")
@@ -159,11 +181,10 @@ else:
 
     st.title(f"专属英语训练舱 🚀")
     
-    # 🌟 万众瞩目的双标签页
     tab_qa, tab_reading = st.tabs(["🗣️ 雅思口语问答", "📖 英式朗读纠音"])
     
     # ==========================================
-    # 模块一：口语问答 (保持不变，连着 database)
+    # 模块一：口语问答 
     # ==========================================
     with tab_qa:
         db_questions = supabase.table("question_bank").select("*").execute()
@@ -230,17 +251,16 @@ else:
                     os.remove(tmp_file_path)
 
     # ==========================================
-    # 模块二：英式朗读纠音 (彻底接入 Database)
+    # 模块二：英式朗读纠音
     # ==========================================
     with tab_reading:
         st.subheader("📖 英文原版朗读纠音")
         
-        # 核心：从新数据库实时抓取阅读文章！
         db_readings = supabase.table("reading_bank").select("*").execute()
         READING_MATERIALS = {row["title"]: row["content"] for row in db_readings.data}
         
         if not READING_MATERIALS:
-            st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏选择【📖 阅读文章库】上传 CSV 或 PDF。")
+            st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏选择【📖 阅读文章库】上传或粘贴文本。")
         else:
             reading_title = st.selectbox("📂 选择朗读材料：", list(READING_MATERIALS.keys()), key="sel_reading")
             reading_text = READING_MATERIALS[reading_title]
@@ -254,7 +274,6 @@ else:
                         tts.save(tmp_tts.name)
                         st.audio(tmp_tts.name, format="audio/mp3")
 
-            # 读取历史纠音记录
             reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", reading_title).execute()
             past_reading_records = reading_db_response.data
             
@@ -290,7 +309,6 @@ else:
                         st.markdown(response.text)
                         st.balloons()
                         
-                        # 保存纠音记录到新数据库
                         supabase.table("reading_history").insert({
                             "username": current_user,
                             "reading_title": reading_title,
