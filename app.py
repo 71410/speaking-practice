@@ -95,7 +95,7 @@ else:
                                         {"role": "system", "content": "You are a precise JSON data extraction tool. Output strictly valid JSON arrays without markdown syntax."},
                                         {"role": "user", "content": prompt}
                                     ],
-                                    temperature=0.1
+                                    temperature=0.1,
                                     max_tokens=8192  # 👈 新增这行！给它最大的肺活量！
                                 )
                                 
@@ -151,7 +151,7 @@ else:
                                             {"role": "system", "content": "You are a precise JSON data extraction tool. Output strictly valid JSON arrays without markdown syntax."},
                                             {"role": "user", "content": prompt}
                                         ],
-                                        temperature=0.1
+                                        temperature=0.1,
                                         max_tokens=8192  # 👈 新增这行！给它最大的肺活量！
                                     )
                                     
@@ -403,5 +403,6 @@ else:
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state[reading_key_name] += 1
                     st.rerun()
+
 
 
