@@ -31,12 +31,71 @@ client_voice = genai.Client(api_key=GEMINI_API_KEY_VOICE)
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 USER_DATABASE = st.secrets["passwords"]
 
+
+def load_profile_information(username: str) -> str:
+    response = (
+        supabase.table("profiles")
+        .select("information")
+        .eq("username", username)
+        .execute()
+    )
+    if response.data and response.data[0].get("information"):
+        return response.data[0]["information"]
+    return ""
+
+
+def save_profile_information(username: str, information: str) -> None:
+    existing = (
+        supabase.table("profiles")
+        .select("id")
+        .eq("username", username)
+        .execute()
+    )
+    if existing.data:
+        supabase.table("profiles").update({"information": information}).eq(
+            "username", username
+        ).execute()
+    else:
+        supabase.table("profiles").insert(
+            {"username": username, "information": information}
+        ).execute()
+
+
+def generate_personalized_answer(question: str, profile_info: str) -> str:
+    profile_block = profile_info.strip() if profile_info.strip() else "（用户尚未填写个人档案）"
+    prompt = f"""
+你是一名雅思口语教练。请根据考生的个人档案，为以下题目生成一段「专属参考答案」。
+
+【题目】：{question}
+
+【考生个人档案】：
+{profile_block}
+
+要求：
+1. 答案必须 100% 贴合该考生的人设、背景、专业与爱好，像他自己会说的真实经历与观点。
+2. 使用口语化、自然的英文表达，像真实人类在雅思考场里即兴说话，避免书面腔和模板句。
+3. 长度符合该题型的正常作答时长（Part 1 约 3-4 句，Part 2 需有清晰结构，Part 3 可稍展开）。
+4. 只输出英文答案正文，不要标题、不要 markdown、不要中文解释。
+"""
+    response = client_admin.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {
+                "role": "system",
+                "content": "You write natural, personalized IELTS speaking sample answers in spoken English only.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
+
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.current_user = ""
 
 if not st.session_state.logged_in:
-    st.title("🔐 高分英语训练舱 - 内部邀请版")
+    st.title(" 高分英语训练舱 - 内部邀请版")
     username = st.text_input("👤 账号")
     password = st.text_input("🔑 密码", type="password")
     
@@ -185,7 +244,7 @@ else:
                         st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
         st.sidebar.markdown("---")
-        st.sidebar.subheader("🗑️ 危险操作区")
+        st.sidebar.subheader(" 危险操作区")
         if st.sidebar.button("🚨 一键清空口语题库", type="primary"):
             supabase.table("question_bank").delete().neq("id", 0).execute()
             st.sidebar.success("✅ 口语题库已清空！")
@@ -194,19 +253,38 @@ else:
             st.sidebar.success("✅ 阅读文章库已清空！")
     
     st.sidebar.markdown("---")
+    page = st.sidebar.radio(
+        "📍 功能导航",
+        ["🗣️ 模拟考官", "📖 英文原版朗读纠音", "👤 个人档案"],
+    )
     if st.sidebar.button("🚪 退出登录"):
         st.session_state.logged_in = False
         st.session_state.current_user = ""
         st.rerun()
 
-    st.title(f"专属英语训练舱 🚀")
-    
-    tab_qa, tab_reading = st.tabs(["🗣️ 雅思口语问答", "📖 英文原版朗读纠音"])
-    
+    st.title("专属英语训练舱 🚀")
+
     # ==========================================
-    # 模块一：口语问答 (使用 client_voice 当考官)
+    # 个人档案
     # ==========================================
-    with tab_qa:
+    if page == "👤 个人档案":
+        st.subheader("👤 个人档案")
+        saved_info = load_profile_information(current_user)
+        profile_text = st.text_area(
+            "请输入你的个人背景、专业、爱好等",
+            value=saved_info,
+            height=300,
+            placeholder="例如：我是计算机专业大三学生，喜欢摄影和徒步，曾在杭州实习……",
+        )
+        if st.button("保存档案", type="primary"):
+            save_profile_information(current_user, profile_text.strip())
+            st.success("✅ 档案已保存！模拟考官答题时会自动用于生成专属答案。")
+            st.rerun()
+
+    # ==========================================
+    # 模块一：模拟考官 (使用 client_voice 当考官)
+    # ==========================================
+    elif page == "🗣️ 模拟考官":
         db_questions = supabase.table("question_bank").select("*").execute()
         IELTS_BANK = {}
         for row in db_questions.data:
@@ -264,12 +342,25 @@ else:
                             请你：
                             1. 【精准听写】：写下听到的英文原话。
                             2. 【切题度与雅思预估分】：评价是否切题，给出预估分数。
-                            3. 【纠错与升级】：给出 2 个针对这道题的高阶示范回答。
+                            3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
                             4. 【考官建议】：用中文给一段备考建议。
                             """
                             response = client_voice.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
                             st.success("🎉 考官点评完成！")
                             st.markdown(response.text)
+
+                            profile_info = load_profile_information(current_user)
+                            with st.spinner("✨ 正在根据你的个人档案定制专属答案..."):
+                                personalized_answer = generate_personalized_answer(
+                                    question, profile_info
+                                )
+                            st.markdown("---")
+                            st.subheader("✨ 你的专属个性化答案")
+                            if not profile_info.strip():
+                                st.caption(
+                                    "💡 你尚未填写个人档案，答案为通用示范。前往左侧「👤 个人档案」填写后，答案将更贴合你的真实人设。"
+                                )
+                            st.markdown(personalized_answer)
                             
                             supabase.table("practice_history").insert({
                                 "username": current_user,
@@ -291,7 +382,7 @@ else:
     # ==========================================
     # 模块二：英文原版朗读纠音 (使用 client_voice 当教练)
     # ==========================================
-    with tab_reading:
+    elif page == "📖 英文原版朗读纠音":
         db_readings = supabase.table("reading_bank").select("*").execute()
         READING_MATERIALS = {row["title"]: row["content"] for row in db_readings.data}
         
