@@ -149,7 +149,7 @@ def parse_writing_extract_json(raw_text: str) -> dict:
 
 def extract_writing_prompt_from_image(image_bytes: bytes) -> dict:
     response = client_voice.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         contents=[
             genai_types.Part.from_bytes(
                 data=image_bytes,
@@ -219,22 +219,15 @@ def load_writing_tasks(task_type: str) -> list:
     return response.data or []
 
 
-def evaluate_writing_essay(
-    task_type: str,
+def evaluate_writing_task1_gemini(
     topic: str,
     instructions: str,
     question_image_b64: str | None,
     user_essay: str,
 ) -> str:
-    task_label = (
-        "Task Achievement (TA)"
-        if task_type == "Task 1"
-        else "Task Response (TR)"
-    )
     prompt = f"""
-你是一名资深雅思写作考官（British Council 标准）。请对以下作文进行严格、专业的多维度批改。
+你是一名资深雅思写作考官（British Council 标准）。请对以下 Task 1 作文进行严格、专业的多维度批改。
 
-【题型】：{task_type}
 【题目主题】：{topic}
 【题目要求】：
 {instructions}
@@ -242,15 +235,14 @@ def evaluate_writing_essay(
 【考生作文】：
 {user_essay}
 
-请严格按以下结构输出（中英文对照，条理清晰）：
+请结合题目配图（如有）严格按以下结构输出（中英文对照，条理清晰）：
 
 ## 📊 预估总得分 (Overall Band Score)
 给出 0.5 为单位的 Band 分数（如 6.5），并简要说明理由。
 
-## 1️⃣ {task_label} / 写作任务回应情况
+## 1️⃣ Task Achievement (TA) / 写作任务回应情况
 - 英文点评 + 中文解读
-- Task 1：是否准确描述图表/地图/流程的关键趋势、极值、对比，有无遗漏或臆造数据
-- Task 2：是否完整回应题目所有部分，立场是否清晰，有无偏题或跑题
+- 是否准确描述图表/地图/流程的关键趋势、极值、对比，有无遗漏或臆造数据
 
 ## 2️⃣ Coherence and Cohesion (CC) / 连贯与衔接
 - 段落结构、逻辑推进、连接词使用是否自然恰当
@@ -283,10 +275,87 @@ def evaluate_writing_essay(
         )
     contents.append(prompt)
     response = client_voice.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.5-flash",
         contents=contents,
     )
     return response.text
+
+
+DEEPSEEK_TASK2_SYSTEM_PROMPT = (
+    "你是一个极其严苛的前雅思考官。请根据雅思 Task 2 官方评分标准 "
+    "（TR, CC, LR, GRA）对用户的作文进行深度批改。指出逻辑漏洞、低级词汇，"
+    "并给出带颜色的修改对照。"
+)
+
+
+def evaluate_writing_task2_deepseek(
+    topic: str,
+    instructions: str,
+    user_essay: str,
+) -> str:
+    user_prompt = f"""
+【题目主题】：{topic}
+
+【题目要求】：
+{instructions}
+
+【考生 Task 2 大作文】：
+{user_essay}
+
+请按雅思 Task 2 官方四项标准（TR, CC, LR, GRA）进行深度批改，严格使用以下结构：
+
+## 📊 预估总得分 (Overall Band Score)
+给出 0.5 为单位的 Band 分数，并说明理由。
+
+## 1️⃣ Task Response (TR) / 任务回应
+- 是否完整回应题目所有部分，立场是否清晰
+- 指出逻辑漏洞、论证薄弱环节（中英文对照）
+
+## 2️⃣ Coherence and Cohesion (CC) / 连贯与衔接
+- 段落结构与衔接词使用评价及改进建议
+
+## 3️⃣ Lexical Resource (LR) / 词汇资源
+- 列出 3-5 处低级/重复词汇，给出高级替换（原词 → 升级词）
+
+## 4️⃣ Grammatical Range and Accuracy (GRA) / 语法
+- 揪出关键语法错误并给出正确写法
+
+## 🎨 带颜色修改对照（必须使用 HTML）
+逐条列出关键句修改，格式示例：
+- 原句：<span style="color:#e74c3c">错误表达</span> → 修改：<span style="color:#27ae60">正确表达</span>（中文说明）
+至少 5 处。
+
+## 📝 逐句润色对照表
+| 原句 | 修改后 | 修改说明（中文）|
+
+## 💡 全面提分建议
+用中文给出 3-5 条针对性备考建议。
+"""
+    response = client_admin.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": DEEPSEEK_TASK2_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=0.3,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def route_writing_evaluation(
+    task_type: str,
+    topic: str,
+    instructions: str,
+    question_image_b64: str | None,
+    user_essay: str,
+) -> str:
+    if task_type == "Task 1":
+        return evaluate_writing_task1_gemini(
+            topic, instructions, question_image_b64, user_essay
+        )
+    if task_type == "Task 2":
+        return evaluate_writing_task2_deepseek(topic, instructions, user_essay)
+    raise ValueError(f"未知题型：{task_type}")
 
 
 if "logged_in" not in st.session_state:
@@ -633,7 +702,7 @@ else:
                             3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
                             4. 【考官建议】：用中文给一段备考建议。
                             """
-                            response = client_voice.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
+                            response = client_voice.models.generate_content(model='gemini-3.5-flash', contents=[audio_file, prompt])
                             st.success("🎉 考官点评完成！")
                             st.markdown(response.text)
 
@@ -761,7 +830,7 @@ else:
                             3. 【语音语调（重音与连读）】：评价考生的意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然。
                             4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
                             """
-                            response = client_voice.models.generate_content(model='gemini-2.5-flash', contents=[audio_file, prompt])
+                            response = client_voice.models.generate_content(model='gemini-3.5-flash', contents=[audio_file, prompt])
                             st.success("🎉 发音诊断报告已生成！")
                             st.markdown(response.text)
                             st.balloons()
@@ -860,9 +929,15 @@ else:
                 if not user_essay.strip():
                     st.error("请先输入作文内容再提交。")
                 else:
-                    with st.spinner("🧠 Gemini 考官正在多维度批改你的作文..."):
+                    is_task1 = writing_task_type == "Task 1"
+                    spinner_msg = (
+                        "👁️ Gemini 视觉引擎正在看图并批改..."
+                        if is_task1
+                        else "🧠 DeepSeek 推理引擎正在深度剖析大作文..."
+                    )
+                    with st.spinner(spinner_msg):
                         try:
-                            evaluation = evaluate_writing_essay(
+                            evaluation = route_writing_evaluation(
                                 writing_task_type,
                                 selected_task["title"],
                                 task_instructions,
@@ -870,7 +945,10 @@ else:
                                 user_essay.strip(),
                             )
                             st.success("🎉 批改完成！")
-                            st.markdown(evaluation)
+                            st.markdown(
+                                evaluation,
+                                unsafe_allow_html=not is_task1,
+                            )
 
                             supabase.table("writing_history").insert({
                                 "username": current_user,
@@ -880,6 +958,7 @@ else:
                             }).execute()
                             st.balloons()
                         except Exception as e:
-                            st.error(f"批改引擎发生小意外：{e}")
+                            engine = "Gemini" if is_task1 else "DeepSeek"
+                            st.error(f"{engine} 批改失败：{e}")
 
 
