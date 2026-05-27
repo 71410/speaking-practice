@@ -1,6 +1,7 @@
 import streamlit as st
 from audio_recorder_streamlit import audio_recorder
 from google import genai
+from google.genai import types as genai_types
 from supabase import create_client, Client
 import pandas as pd
 import tempfile
@@ -9,6 +10,7 @@ import json
 import re  
 from gtts import gTTS
 import base64
+import hashlib
 import io
 from openai import OpenAI
 import PyPDF2
@@ -90,6 +92,203 @@ def generate_personalized_answer(question: str, profile_info: str) -> str:
     )
     return response.choices[0].message.content.strip()
 
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text.strip()))
+
+
+def file_to_base64(uploaded_file) -> str:
+    return base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
+
+
+def base64_to_image_bytes(b64_str: str) -> bytes | None:
+    if not b64_str or not str(b64_str).strip():
+        return None
+    raw = str(b64_str).strip()
+    if "," in raw and raw.startswith("data:"):
+        raw = raw.split(",", 1)[1]
+    return base64.b64decode(raw)
+
+
+def image_mime_type(image_bytes: bytes) -> str:
+    if image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return "image/jpeg"
+
+
+WRITING_IMAGE_EXTRACT_PROMPT = """
+这是一张雅思写作考试的题目图片。请分析图片并严格输出一个 JSON 对象（不要 markdown 代码块、不要任何中文解释或寒暄）。
+
+JSON 必须且仅包含以下两个字段：
+1. "topic": 极其简短的英文作文主题（例如 "Location of dance classes"），不超过 12 个英文单词。
+2. "instructions": 纯粹的题目描述与写作要求全文（例如题干 "The charts below give information..." 以及 "Summarise the information by selecting and reporting the main features..." 等）。
+
+【严禁包含】图表内部的具体数据点、数字、百分比、坐标轴标签、刻度、图例分类名称、表格单元格数值等图表细节。
+只保留考生需要阅读的「题目说明」和「写作指令」。
+
+输出示例格式：
+{"topic": "Population change in three countries", "instructions": "The chart below shows... Write at least 150 words."}
+"""
+
+
+def parse_writing_extract_json(raw_text: str) -> dict:
+    raw = raw_text.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    data = json.loads(raw.strip())
+    topic = str(data.get("topic", "")).strip()
+    instructions = str(data.get("instructions", "")).strip()
+    if not topic or not instructions:
+        raise ValueError("AI 返回的 JSON 缺少 topic 或 instructions 字段。")
+    return {"topic": topic, "instructions": instructions}
+
+
+def extract_writing_prompt_from_image(image_bytes: bytes) -> dict:
+    response = client_voice.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[
+            genai_types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=image_mime_type(image_bytes),
+            ),
+            WRITING_IMAGE_EXTRACT_PROMPT,
+        ],
+    )
+    return parse_writing_extract_json(response.text)
+
+
+def init_admin_writing_session_state() -> None:
+    defaults = {
+        "admin_writing_fingerprint": "",
+        "admin_writing_image_b64": "",
+        "admin_writing_ready": False,
+        "admin_writing_topic_draft": "",
+        "admin_writing_content_draft": "",
+        "admin_writing_form_gen": 0,
+        "admin_writing_uploader_gen": 0,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def reset_admin_writing_session_state() -> None:
+    """只清理数据层状态；通过递增 form_gen 废弃旧 widget，不直接改写 widget 的 session_state。"""
+    st.session_state.admin_writing_fingerprint = ""
+    st.session_state.admin_writing_image_b64 = ""
+    st.session_state.admin_writing_ready = False
+    st.session_state.admin_writing_topic_draft = ""
+    st.session_state.admin_writing_content_draft = ""
+    st.session_state.admin_writing_form_gen += 1
+
+
+def admin_writing_topic_widget_key() -> str:
+    return f"admin_writing_topic_widget_{st.session_state.admin_writing_form_gen}"
+
+
+def admin_writing_content_widget_key() -> str:
+    return f"admin_writing_content_widget_{st.session_state.admin_writing_form_gen}"
+
+
+def get_admin_writing_topic() -> str:
+    return st.session_state.get(
+        admin_writing_topic_widget_key(),
+        st.session_state.get("admin_writing_topic_draft", ""),
+    ).strip()
+
+
+def get_admin_writing_content() -> str:
+    return st.session_state.get(
+        admin_writing_content_widget_key(),
+        st.session_state.get("admin_writing_content_draft", ""),
+    ).strip()
+
+
+def load_writing_tasks(task_type: str) -> list:
+    response = (
+        supabase.table("writing_bank")
+        .select("*")
+        .eq("task_type", task_type)
+        .order("id")
+        .execute()
+    )
+    return response.data or []
+
+
+def evaluate_writing_essay(
+    task_type: str,
+    topic: str,
+    instructions: str,
+    question_image_b64: str | None,
+    user_essay: str,
+) -> str:
+    task_label = (
+        "Task Achievement (TA)"
+        if task_type == "Task 1"
+        else "Task Response (TR)"
+    )
+    prompt = f"""
+你是一名资深雅思写作考官（British Council 标准）。请对以下作文进行严格、专业的多维度批改。
+
+【题型】：{task_type}
+【题目主题】：{topic}
+【题目要求】：
+{instructions}
+
+【考生作文】：
+{user_essay}
+
+请严格按以下结构输出（中英文对照，条理清晰）：
+
+## 📊 预估总得分 (Overall Band Score)
+给出 0.5 为单位的 Band 分数（如 6.5），并简要说明理由。
+
+## 1️⃣ {task_label} / 写作任务回应情况
+- 英文点评 + 中文解读
+- Task 1：是否准确描述图表/地图/流程的关键趋势、极值、对比，有无遗漏或臆造数据
+- Task 2：是否完整回应题目所有部分，立场是否清晰，有无偏题或跑题
+
+## 2️⃣ Coherence and Cohesion (CC) / 连贯与衔接
+- 段落结构、逻辑推进、连接词使用是否自然恰当
+- 指出具体问题并给出改进建议
+
+## 3️⃣ Lexical Resource (LR) / 词汇资源
+- 列出文中 3-5 处明显的低级/重复词汇，给出高级替换建议（原词 → 升级词）
+- 评价词汇多样性与搭配准确性
+
+## 4️⃣ Grammatical Range and Accuracy (GRA) / 语法多样性与准确性
+- 揪出语法错误（时态、主谓一致、冠词、从句等），给出正确写法
+- 评价句式多样性
+
+## 📝 逐句语法修改润色对照表
+用表格形式列出（Markdown 表格）：
+| 原句 | 修改后 | 修改说明（中文）|
+至少覆盖 5 处最值得修改的句子（若错误不足 5 处则全部列出）。
+
+## 💡 全面提分建议
+用中文给出 3-5 条可操作的备考建议，针对该考生本次作文的薄弱点。
+"""
+    contents: list = []
+    image_bytes = base64_to_image_bytes(question_image_b64) if question_image_b64 else None
+    if image_bytes:
+        contents.append(
+            genai_types.Part.from_bytes(
+                data=image_bytes,
+                mime_type=image_mime_type(image_bytes),
+            )
+        )
+    contents.append(prompt)
+    response = client_voice.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=contents,
+    )
+    return response.text
+
+
 if "logged_in" not in st.session_state:
     st.session_state.logged_in = False
     st.session_state.current_user = ""
@@ -116,7 +315,10 @@ else:
     if current_user == "admin":
         st.sidebar.markdown("---")
         st.sidebar.subheader("⚙️ 管理员后台")
-        upload_target = st.sidebar.radio("🎯 选择导入目标：", ["🗣️ 口语题库", "📖 阅读文章库"])
+        upload_target = st.sidebar.radio(
+            "🎯 选择导入目标：",
+            ["🗣️ 口语题库", "📖 阅读文章库", "✍️ 管理写作题库"],
+        )
         
         if upload_target == "🗣️ 口语题库":
             uploaded_file = st.sidebar.file_uploader("📂 智能导入口语题 (CSV / PDF)", type=["csv", "pdf"])
@@ -243,6 +445,84 @@ else:
                     else:
                         st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
+        elif upload_target == "✍️ 管理写作题库":
+            init_admin_writing_session_state()
+            st.sidebar.markdown("**✍️ 写作题库上传**（上传图片 → AI 自动识题）")
+
+            writing_task_type = st.sidebar.selectbox(
+                "📋 选择题型：",
+                ["Task 1", "Task 2"],
+                key="admin_writing_task_type",
+            )
+            uploader_key = f"admin_writing_image_{st.session_state.admin_writing_uploader_gen}"
+            writing_image = st.sidebar.file_uploader(
+                "🖼️ 上传题目图片（png / jpg）",
+                type=["png", "jpg", "jpeg"],
+                key=uploader_key,
+            )
+
+            if writing_image is None:
+                if st.session_state.admin_writing_fingerprint:
+                    reset_admin_writing_session_state()
+                st.sidebar.caption("请先上传题目图片，AI 将自动提取英文题目文本。")
+            else:
+                img_bytes = writing_image.getvalue()
+                fingerprint = hashlib.md5(img_bytes).hexdigest()
+
+                if st.session_state.admin_writing_fingerprint != fingerprint:
+                    with st.spinner("🤖 AI 正在努力看图提取题目文字中..."):
+                        try:
+                            parsed = extract_writing_prompt_from_image(img_bytes)
+                            st.session_state.admin_writing_fingerprint = fingerprint
+                            st.session_state.admin_writing_image_b64 = base64.b64encode(
+                                img_bytes
+                            ).decode("utf-8")
+                            st.session_state.admin_writing_topic_draft = parsed["topic"]
+                            st.session_state.admin_writing_content_draft = parsed["instructions"]
+                            st.session_state.admin_writing_ready = True
+                            st.session_state.admin_writing_form_gen += 1
+                        except Exception as e:
+                            st.sidebar.error(f"AI 识图失败：{e}")
+
+                st.sidebar.image(img_bytes, caption="题目预览", use_container_width=True)
+
+                if st.session_state.admin_writing_ready:
+                    st.sidebar.text_input(
+                        "📌 题目主题 (topic)",
+                        value=st.session_state.admin_writing_topic_draft,
+                        key=admin_writing_topic_widget_key(),
+                    )
+                    st.sidebar.text_area(
+                        "📝 题目要求 (instructions)",
+                        value=st.session_state.admin_writing_content_draft,
+                        height=280,
+                        key=admin_writing_content_widget_key(),
+                    )
+                    st.sidebar.caption("请核对 topic 与 instructions，确认无误后再保存。")
+
+            if st.sidebar.button("🚀 保存至写作题库", type="primary", key="btn_save_writing"):
+                topic = get_admin_writing_topic()
+                content = get_admin_writing_content()
+                image_b64 = st.session_state.get("admin_writing_image_b64", "")
+                if not image_b64:
+                    st.sidebar.warning("⚠️ 请先上传题目图片！")
+                elif not topic:
+                    st.sidebar.warning("⚠️ 题目主题 (topic) 不能为空！")
+                elif not content:
+                    st.sidebar.warning("⚠️ 题目要求 (instructions) 不能为空！")
+                else:
+                    with st.spinner("正在写入写作题库..."):
+                        supabase.table("writing_bank").insert({
+                            "task_type": writing_task_type,
+                            "title": topic,
+                            "content": content,
+                            "question_image": image_b64,
+                        }).execute()
+                    st.sidebar.success(f"✅ 已保存 {writing_task_type} 写作题！")
+                    reset_admin_writing_session_state()
+                    st.session_state.admin_writing_uploader_gen += 1
+                    st.rerun()
+
         st.sidebar.markdown("---")
         st.sidebar.subheader(" 危险操作区")
         if st.sidebar.button("🚨 一键清空口语题库", type="primary"):
@@ -251,11 +531,19 @@ else:
         if st.sidebar.button("🚨 一键清空阅读文章", type="primary"):
             supabase.table("reading_bank").delete().neq("id", 0).execute()
             st.sidebar.success("✅ 阅读文章库已清空！")
+        if st.sidebar.button("🚨 一键清空写作题库", type="primary"):
+            supabase.table("writing_bank").delete().neq("id", 0).execute()
+            st.sidebar.success("✅ 写作题库已清空！")
     
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "📍 功能导航",
-        ["🗣️ 模拟考官", "📖 英文原版朗读纠音", "👤 个人档案"],
+        [
+            "🗣️ 模拟考官",
+            "📖 英文原版朗读纠音",
+            "✍️ 雅思写作练习",
+            "👤 个人档案",
+        ],
     )
     if st.sidebar.button("🚪 退出登录"):
         st.session_state.logged_in = False
@@ -495,5 +783,103 @@ else:
                     st.session_state[reading_key_name] += 1
                     st.rerun()
 
+    # ==========================================
+    # 模块三：雅思写作练习 (Gemini 多模态批改)
+    # ==========================================
+    elif page == "✍️ 雅思写作练习":
+        st.subheader("📝 Step 1: 选择题目")
+        writing_task_type = st.selectbox(
+            "📋 选择题型：",
+            ["Task 1", "Task 2"],
+            key="writing_task_type",
+        )
+        word_target = 150 if writing_task_type == "Task 1" else 250
+        tasks = load_writing_tasks(writing_task_type)
+
+        if not tasks:
+            st.info(
+                f"当前 {writing_task_type} 题库为空，请联系管理员在左侧「✍️ 管理写作题库」上传题目。"
+            )
+        else:
+            def _task_label(idx: int) -> str:
+                t = tasks[idx]
+                return f"[{t['task_type']}] {t['title']}"
+
+            selected_idx = st.selectbox(
+                "🎯 选择具体题目：",
+                range(len(tasks)),
+                format_func=_task_label,
+                key="writing_task_select",
+            )
+            selected_task = tasks[selected_idx]
+            task_id = selected_task["id"]
+            task_instructions = (
+                selected_task.get("content") or selected_task.get("title") or ""
+            )
+
+            st.markdown("**题目要求：**")
+            st.markdown(task_instructions)
+
+            img_bytes = base64_to_image_bytes(selected_task.get("question_image"))
+            if img_bytes:
+                st.image(img_bytes, caption="题目图表", use_container_width=True)
+
+            history_resp = (
+                supabase.table("writing_history")
+                .select("evaluation, created_at")
+                .eq("username", current_user)
+                .eq("task_id", task_id)
+                .order("created_at", desc=True)
+                .execute()
+            )
+            past_writing = history_resp.data or []
+            if past_writing:
+                with st.expander(f"📖 查看本题的 {len(past_writing)} 次历史批改"):
+                    for i, record in enumerate(past_writing):
+                        created = record.get("created_at", "")
+                        st.markdown(f"**▶ 第 {i + 1} 次** {created}")
+                        st.markdown(record["evaluation"])
+                        st.write("---")
+
+            st.write("---")
+            st.subheader("✍️ Step 2: 开始写作")
+            st.caption(f"建议字数：{word_target} 词（{writing_task_type}）")
+
+            user_essay = st.text_area(
+                "在此输入你的作文（英文）",
+                height=350,
+                key=f"writing_textarea_{task_id}",
+            )
+            word_count = count_words(user_essay)
+            if word_count < word_target:
+                st.warning(f"📏 当前字数：**{word_count}** / 建议 {word_target} 词（尚未达标）")
+            else:
+                st.success(f"📏 当前字数：**{word_count}** / 建议 {word_target} 词（已达标 ✅）")
+
+            if st.button("📤 提交批改", type="primary", key=f"btn_submit_writing_{task_id}"):
+                if not user_essay.strip():
+                    st.error("请先输入作文内容再提交。")
+                else:
+                    with st.spinner("🧠 Gemini 考官正在多维度批改你的作文..."):
+                        try:
+                            evaluation = evaluate_writing_essay(
+                                writing_task_type,
+                                selected_task["title"],
+                                task_instructions,
+                                selected_task.get("question_image"),
+                                user_essay.strip(),
+                            )
+                            st.success("🎉 批改完成！")
+                            st.markdown(evaluation)
+
+                            supabase.table("writing_history").insert({
+                                "username": current_user,
+                                "task_id": task_id,
+                                "user_essay": user_essay.strip(),
+                                "evaluation": evaluation,
+                            }).execute()
+                            st.balloons()
+                        except Exception as e:
+                            st.error(f"批改引擎发生小意外：{e}")
 
 
