@@ -22,18 +22,29 @@ SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
 
 # 引擎 A：负责后台苦力（DeepSeek 文本解析）
-client_admin = OpenAI(
-    api_key=DEEPSEEK_API_KEY,
-    base_url="https://api.deepseek.com" # DeepSeek 官方接口
-)
+@st.cache_resource
+def get_admin_client() -> OpenAI:
+    return OpenAI(
+        api_key=DEEPSEEK_API_KEY,
+        base_url="https://api.deepseek.com",
+    )
 
 # 引擎 B：负责前台考官（Gemini 语音打分）
-client_voice = genai.Client(api_key=GEMINI_API_KEY_VOICE)
+@st.cache_resource
+def get_voice_client() -> genai.Client:
+    return genai.Client(api_key=GEMINI_API_KEY_VOICE)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+@st.cache_resource
+def get_supabase_client() -> Client:
+    return create_client(SUPABASE_URL, SUPABASE_KEY)
+
+client_admin = get_admin_client()
+client_voice = get_voice_client()
+supabase: Client = get_supabase_client()
 USER_DATABASE = st.secrets["passwords"]
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def load_profile_information(username: str) -> str:
     response = (
         supabase.table("profiles")
@@ -61,6 +72,7 @@ def save_profile_information(username: str, information: str) -> None:
         supabase.table("profiles").insert(
             {"username": username, "information": information}
         ).execute()
+    load_profile_information.clear()
 
 
 def generate_personalized_answer(question: str, profile_info: str) -> str:
@@ -208,12 +220,77 @@ def get_admin_writing_content() -> str:
     ).strip()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def load_writing_tasks(task_type: str) -> list:
     response = (
         supabase.table("writing_bank")
         .select("*")
         .eq("task_type", task_type)
         .order("id")
+        .execute()
+    )
+    return response.data or []
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_question_bank() -> dict:
+    """加载完整口语题库，缓存 5 分钟。管理员上传新题后自动刷新。"""
+    response = supabase.table("question_bank").select("*").execute()
+    bank: dict = {}
+    for row in (response.data or []):
+        p = row.get("part", "未分类")
+        t = row.get("theme", "未分类")
+        q = row.get("question_text", "提取失败")
+        if p not in bank:
+            bank[p] = {}
+        if t not in bank[p]:
+            bank[p][t] = []
+        bank[p][t].append(q)
+    return bank
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_reading_bank() -> dict:
+    """加载完整阅读材料库，缓存 5 分钟。"""
+    response = supabase.table("reading_bank").select("*").execute()
+    return {row["title"]: row["content"] for row in (response.data or [])}
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_practice_history(username: str, question: str) -> list:
+    """加载某用户某道题的练习历史，缓存 30 秒。"""
+    response = (
+        supabase.table("practice_history")
+        .select("record_text")
+        .eq("username", username)
+        .eq("question", question)
+        .execute()
+    )
+    return response.data or []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_reading_history(username: str, reading_title: str) -> list:
+    """加载某用户某材料的朗读历史，缓存 30 秒。"""
+    response = (
+        supabase.table("reading_history")
+        .select("record_text")
+        .eq("username", username)
+        .eq("reading_title", reading_title)
+        .execute()
+    )
+    return response.data or []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_writing_history(username: str, task_id: int) -> list:
+    """加载某用户某写作题的历史批改，缓存 30 秒。"""
+    response = (
+        supabase.table("writing_history")
+        .select("evaluation, created_at")
+        .eq("username", username)
+        .eq("task_id", task_id)
+        .order("created_at", desc=True)
         .execute()
     )
     return response.data or []
@@ -462,6 +539,7 @@ def evaluate_writing_task2_deepseek(
 三条建议，每条必须包含：
 - 具体问题 → 具体操作 → 预期效果
 - 严禁泛泛而谈的"多读多写多练"
+    """
 
     response = client_admin.chat.completions.create(
         model="deepseek-chat",
@@ -535,6 +613,7 @@ else:
                                     "question_text": str(row["question"])
                                 }).execute()
                         st.sidebar.success("✅ 口语 CSV 导入成功！")
+                        load_question_bank.clear()
                     
                     elif uploaded_file.name.endswith('.pdf'):
                         with st.spinner("🤖 正在召唤 DeepSeek 大脑提取题目..."):
@@ -574,6 +653,7 @@ else:
                                         "question_text": str(item.get("question", "提取失败"))
                                     }).execute()
                                 st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 道口语题！")
+                                load_question_bank.clear()
                             except Exception as e:
                                 st.sidebar.error(f"DeepSeek 解析短路：{e}")
 
@@ -592,6 +672,7 @@ else:
                                         "content": str(row["content"])
                                     }).execute()
                             st.sidebar.success("✅ 阅读 CSV 导入成功！")
+                            load_reading_bank.clear()
                         elif uploaded_file.name.endswith('.pdf'):
                             with st.spinner("🤖 正在召唤 DeepSeek 大脑拆解文章..."):
                                 try:
@@ -629,6 +710,7 @@ else:
                                             "content": str(item.get("content", "内容提取失败"))
                                         }).execute()
                                     st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 篇阅读文章！")
+                                    load_reading_bank.clear()
                                 except Exception as e:
                                     st.sidebar.error(f"DeepSeek 解析短路：{e}")
                                     
@@ -643,6 +725,7 @@ else:
                                 "content": manual_content.strip()
                             }).execute()
                         st.sidebar.success(f"✅ 《{manual_title}》已成功存入！")
+                        load_reading_bank.clear()
                     else:
                         st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
@@ -720,6 +803,7 @@ else:
                             "question_image": image_b64,
                         }).execute()
                     st.sidebar.success(f"✅ 已保存 {writing_task_type} 写作题！")
+                    load_writing_tasks.clear()
                     reset_admin_writing_session_state()
                     st.session_state.admin_writing_uploader_gen += 1
                     st.rerun()
@@ -728,12 +812,15 @@ else:
         st.sidebar.subheader(" 危险操作区")
         if st.sidebar.button("🚨 一键清空口语题库", type="primary"):
             supabase.table("question_bank").delete().neq("id", 0).execute()
+            load_question_bank.clear()
             st.sidebar.success("✅ 口语题库已清空！")
         if st.sidebar.button("🚨 一键清空阅读文章", type="primary"):
             supabase.table("reading_bank").delete().neq("id", 0).execute()
+            load_reading_bank.clear()
             st.sidebar.success("✅ 阅读文章库已清空！")
         if st.sidebar.button("🚨 一键清空写作题库", type="primary"):
             supabase.table("writing_bank").delete().neq("id", 0).execute()
+            load_writing_tasks.clear()
             st.sidebar.success("✅ 写作题库已清空！")
     
     st.sidebar.markdown("---")
@@ -774,15 +861,7 @@ else:
     # 模块一：模拟考官 (使用 client_voice 当考官)
     # ==========================================
     elif page == "🗣️ 模拟考官":
-        db_questions = supabase.table("question_bank").select("*").execute()
-        IELTS_BANK = {}
-        for row in db_questions.data:
-            p = row.get("part", "未分类")
-            t = row.get("theme", "未分类")
-            q = row.get("question_text", "提取失败")
-            if p not in IELTS_BANK: IELTS_BANK[p] = {}
-            if t not in IELTS_BANK[p]: IELTS_BANK[p][t] = []
-            IELTS_BANK[p][t].append(q)
+        IELTS_BANK = load_question_bank()
 
         st.subheader("📝 Step 1: 从题库中抽题")
         if not IELTS_BANK:
@@ -793,8 +872,7 @@ else:
             question = st.selectbox("🎯 选择具体题目：", IELTS_BANK[selected_part][selected_theme], key="qa_q")
             st.info(f"**考官提问：** {question}")
 
-            db_response = supabase.table("practice_history").select("record_text").eq("username", current_user).eq("question", question).execute()
-            past_records = db_response.data
+            past_records = load_practice_history(current_user, question)
             if len(past_records) > 0:
                 with st.expander(f"📖 查看这道题的 {len(past_records)} 次历史点评记录"):
                     for i, record in enumerate(past_records):
@@ -856,7 +934,8 @@ else:
                                 "question": question,
                                 "record_text": response.text
                             }).execute()
-                            
+                            load_practice_history.clear()
+
                             st.session_state[last_audio_tracker_qa] = audio_bytes_qa
                             
                         except Exception as e:
@@ -872,8 +951,7 @@ else:
     # 模块二：英文原版朗读纠音 (使用 client_voice 当教练)
     # ==========================================
     elif page == "📖 英文原版朗读纠音":
-        db_readings = supabase.table("reading_bank").select("*").execute()
-        READING_MATERIALS = {row["title"]: row["content"] for row in db_readings.data}
+        READING_MATERIALS = load_reading_bank()
         
         if not READING_MATERIALS:
             st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏上传或粘贴文本。")
@@ -918,8 +996,7 @@ else:
                         """
                     st.markdown(md, unsafe_allow_html=True)
 
-            reading_db_response = supabase.table("reading_history").select("record_text").eq("username", current_user).eq("reading_title", db_save_title).execute()
-            past_reading_records = reading_db_response.data
+            past_reading_records = load_reading_history(current_user, db_save_title)
             
             if len(past_reading_records) > 0:
                 with st.expander(f"📖 查看此项的 {len(past_reading_records)} 次历史纠音记录"):
@@ -972,7 +1049,8 @@ else:
                                 "reading_title": db_save_title,
                                 "record_text": response.text
                             }).execute()
-                            
+                            load_reading_history.clear()
+
                             st.session_state[last_audio_tracker_reading] = audio_bytes_reading
                             
                         except Exception as e:
@@ -1025,15 +1103,7 @@ else:
             if img_bytes:
                 st.image(img_bytes, caption="题目图表", use_container_width=True)
 
-            history_resp = (
-                supabase.table("writing_history")
-                .select("evaluation, created_at")
-                .eq("username", current_user)
-                .eq("task_id", task_id)
-                .order("created_at", desc=True)
-                .execute()
-            )
-            past_writing = history_resp.data or []
+            past_writing = load_writing_history(current_user, task_id)
             if past_writing:
                 with st.expander(f"📖 查看本题的 {len(past_writing)} 次历史批改"):
                     for i, record in enumerate(past_writing):
@@ -1088,6 +1158,7 @@ else:
                                 "user_essay": user_essay.strip(),
                                 "evaluation": evaluation,
                             }).execute()
+                            load_writing_history.clear()
                             st.balloons()
                         except Exception as e:
                             engine = "Gemini" if is_task1 else "DeepSeek"
