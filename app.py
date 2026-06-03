@@ -60,7 +60,7 @@ def load_profile_information(username: str) -> str:
 def save_profile_information(username: str, information: str) -> None:
     existing = (
         supabase.table("profiles")
-        .select("id")
+        .select("username")
         .eq("username", username)
         .execute()
     )
