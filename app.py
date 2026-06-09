@@ -888,8 +888,9 @@ else:
                 st.session_state[qa_key_name] = 0
                 
             audio_bytes_qa = audio_recorder(
-                text="点击麦克风开始作答", 
-                icon_size="2x", 
+                text="点击麦克风开始作答",
+                icon_size="2x",
+                pause_threshold=60.0,
                 key=f"recorder_qa_{question}_{st.session_state[qa_key_name]}"
             )
 
@@ -1013,8 +1014,9 @@ else:
                 st.session_state[reading_key_name] = 0
                 
             audio_bytes_reading = audio_recorder(
-                text="点击录制你的朗读", 
-                icon_size="2x", 
+                text="点击录制你的朗读",
+                icon_size="2x",
+                pause_threshold=60.0,
                 key=f"recorder_reading_{db_save_title}_{st.session_state[reading_key_name]}"
             )
 
