@@ -121,6 +121,27 @@ def submit_audio_for_scoring(pending_key: str) -> None:
     st.rerun()
 
 
+def render_personalized_answer(question: str, username: str, answer_key: str, button_key: str) -> None:
+    if st.session_state.get(answer_key):
+        st.markdown("---")
+        st.subheader("✨ 你的专属个性化答案")
+        st.markdown(st.session_state[answer_key])
+        return
+
+    if st.button("✨ 生成专属参考答案", key=button_key):
+        profile_info = load_profile_information(username)
+        with st.spinner("正在根据你的个人档案定制专属答案..."):
+            personalized_answer = generate_personalized_answer(question, profile_info)
+        st.session_state[answer_key] = personalized_answer
+        st.markdown("---")
+        st.subheader("✨ 你的专属个性化答案")
+        if not profile_info.strip():
+            st.caption(
+                "你尚未填写个人档案，答案为通用示范。前往左侧「个人档案」填写后，答案将更贴合你的真实人设。"
+            )
+        st.markdown(personalized_answer)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_profile_information(username: str) -> str:
     response = (
@@ -1038,27 +1059,12 @@ else:
 
                 if qa_already_scored:
                     st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
-                    if st.session_state.get(qa_answer_key):
-                        st.markdown("---")
-                        st.subheader("✨ 你的专属个性化答案")
-                        st.markdown(st.session_state[qa_answer_key])
-                    elif st.button(
-                        "✨ 生成专属参考答案",
-                        key=f"answer_qa_{question}_{st.session_state[qa_key_name]}",
-                    ):
-                        profile_info = load_profile_information(current_user)
-                        with st.spinner("正在根据你的个人档案定制专属答案..."):
-                            personalized_answer = generate_personalized_answer(
-                                question, profile_info
-                            )
-                        st.session_state[qa_answer_key] = personalized_answer
-                        st.markdown("---")
-                        st.subheader("✨ 你的专属个性化答案")
-                        if not profile_info.strip():
-                            st.caption(
-                                "你尚未填写个人档案，答案为通用示范。前往左侧「个人档案」填写后，答案将更贴合你的真实人设。"
-                            )
-                        st.markdown(personalized_answer)
+                    render_personalized_answer(
+                        question,
+                        current_user,
+                        qa_answer_key,
+                        f"answer_qa_{question}_{st.session_state[qa_key_name]}",
+                    )
                 elif st.session_state.get(qa_pending_key):
                     status_box = st.status(
                         "正在处理本次录音评分，请勿刷新页面",
@@ -1096,6 +1102,12 @@ else:
                         st.session_state.pop(f"{qa_pending_key}_started_at", None)
                         status_box.update(label="本次录音评分完成", state="complete")
                         st.info("如需专属参考答案，请点击下方按钮生成。")
+                        render_personalized_answer(
+                            question,
+                            current_user,
+                            qa_answer_key,
+                            f"answer_qa_done_{question}_{st.session_state[qa_key_name]}",
+                        )
                         
                     except Exception as e:
                         st.session_state[qa_pending_key] = False
