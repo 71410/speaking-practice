@@ -4,8 +4,6 @@ from google import genai
 from google.genai import types as genai_types
 from supabase import create_client, Client
 import pandas as pd
-import tempfile
-import os
 import json
 import re  
 from gtts import gTTS
@@ -65,7 +63,7 @@ def is_transient_gemini_error(error: Exception) -> bool:
 def generate_gemini_content_with_retry(
     contents: list,
     model: str = GEMINI_FLASH_MODEL,
-    retry_delays: tuple[int, ...] = (2, 5, 10),
+    retry_delays: tuple[int, ...] = (1, 2, 4),
 ):
     last_error = None
     for attempt in range(len(retry_delays) + 1):
@@ -85,6 +83,10 @@ def show_gemini_busy_error(error: Exception) -> None:
     else:
         st.error("Gemini 请求失败。录音已保留，可以稍后直接重新请求评分。")
     st.caption(f"服务返回：{str(error)[:240]}")
+
+
+def wav_audio_part(audio_bytes: bytes):
+    return genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -990,11 +992,7 @@ else:
                 
                 if st.session_state.get(last_audio_tracker_qa) != audio_bytes_qa:
                     with st.spinner("🧠 专属考官 Voice 引擎正在仔细聆听..."):
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                            tmp_file.write(audio_bytes_qa)
-                            tmp_file_path = tmp_file.name
                         try:
-                            audio_file = client_voice.files.upload(file=tmp_file_path)
                             prompt = f"""
                             你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
                             请你：
@@ -1004,7 +1002,7 @@ else:
                             4. 【考官建议】：用中文给一段备考建议。
                             """
                             response = generate_gemini_content_with_retry(
-                                contents=[audio_file, prompt]
+                                contents=[wav_audio_part(audio_bytes_qa), prompt]
                             )
                             st.success("🎉 考官点评完成！")
                             st.markdown(response.text)
@@ -1035,9 +1033,6 @@ else:
                             show_gemini_busy_error(e)
                             if st.button("重新请求本次录音评分", key=f"retry_qa_{question}_{st.session_state[qa_key_name]}"):
                                 st.rerun()
-                        finally:
-                            if os.path.exists(tmp_file_path):
-                                os.remove(tmp_file_path)
 
                 st.markdown("---")
                 if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
@@ -1117,11 +1112,7 @@ else:
                 
                 if st.session_state.get(last_audio_tracker_reading) != audio_bytes_reading:
                     with st.spinner("🧠 专属教练 Voice 引擎正在评估..."):
-                        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
-                            tmp_file.write(audio_bytes_reading)
-                            tmp_file_path = tmp_file.name
                         try:
-                            audio_file = client_voice.files.upload(file=tmp_file_path)
                             prompt = f"""
                             你现在是一名雅思口语考官兼流利度教练。考生正在朗读这段指定的文本：“{target_text}”
                             我已经上传了考生的录音。
@@ -1133,7 +1124,7 @@ else:
                             4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
                             """
                             response = generate_gemini_content_with_retry(
-                                contents=[audio_file, prompt]
+                                contents=[wav_audio_part(audio_bytes_reading), prompt]
                             )
                             st.success("🎉 发音诊断报告已生成！")
                             st.markdown(response.text)
@@ -1152,9 +1143,6 @@ else:
                             show_gemini_busy_error(e)
                             if st.button("重新请求本次朗读评分", key=f"retry_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                                 st.rerun()
-                        finally:
-                            if os.path.exists(tmp_file_path):
-                                os.remove(tmp_file_path)
 
                 st.markdown("---")
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
