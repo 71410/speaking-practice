@@ -89,6 +89,13 @@ def wav_audio_part(audio_bytes: bytes):
     return genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
 
 
+def show_audio_payload_info(audio_bytes: bytes) -> None:
+    size_mb = len(audio_bytes) / 1024 / 1024
+    st.caption(f"录音大小：{size_mb:.2f} MB。2 分钟内通常可以提交；如果超过 15 MB，建议分段练习。")
+    if size_mb > 15:
+        st.warning("这段录音较大，评分可能明显变慢或失败。建议缩短录音或分成多段提交。")
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_profile_information(username: str) -> str:
     response = (
@@ -988,9 +995,17 @@ else:
 
             if audio_bytes_qa:
                 st.audio(audio_bytes_qa, format="audio/wav")
+                show_audio_payload_info(audio_bytes_qa)
                 last_audio_tracker_qa = f"last_audio_{question}"
-                
-                if st.session_state.get(last_audio_tracker_qa) != audio_bytes_qa:
+                qa_already_scored = st.session_state.get(last_audio_tracker_qa) == audio_bytes_qa
+
+                if qa_already_scored:
+                    st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
+                elif st.button(
+                    "📤 提交本次录音评分",
+                    type="primary",
+                    key=f"submit_qa_{question}_{st.session_state[qa_key_name]}",
+                ):
                     with st.spinner("🧠 专属考官 Voice 引擎正在仔细聆听..."):
                         try:
                             prompt = f"""
@@ -1031,8 +1046,6 @@ else:
                             
                         except Exception as e:
                             show_gemini_busy_error(e)
-                            if st.button("重新请求本次录音评分", key=f"retry_qa_{question}_{st.session_state[qa_key_name]}"):
-                                st.rerun()
 
                 st.markdown("---")
                 if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
@@ -1108,9 +1121,19 @@ else:
 
             if audio_bytes_reading:
                 st.audio(audio_bytes_reading, format="audio/wav")
+                show_audio_payload_info(audio_bytes_reading)
                 last_audio_tracker_reading = f"last_audio_{db_save_title}"
-                
-                if st.session_state.get(last_audio_tracker_reading) != audio_bytes_reading:
+                reading_already_scored = (
+                    st.session_state.get(last_audio_tracker_reading) == audio_bytes_reading
+                )
+
+                if reading_already_scored:
+                    st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
+                elif st.button(
+                    "📤 提交本次朗读评分",
+                    type="primary",
+                    key=f"submit_reading_{db_save_title}_{st.session_state[reading_key_name]}",
+                ):
                     with st.spinner("🧠 专属教练 Voice 引擎正在评估..."):
                         try:
                             prompt = f"""
@@ -1141,8 +1164,6 @@ else:
                             
                         except Exception as e:
                             show_gemini_busy_error(e)
-                            if st.button("重新请求本次朗读评分", key=f"retry_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
-                                st.rerun()
 
                 st.markdown("---")
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
