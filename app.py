@@ -46,6 +46,8 @@ GEMINI_FLASH_MODEL = "gemini-3.5-flash"
 
 def is_transient_gemini_error(error: Exception) -> bool:
     message = str(error).lower()
+    if is_gemini_quota_error(error):
+        return False
     transient_markers = [
         "503",
         "unavailable",
@@ -58,6 +60,17 @@ def is_transient_gemini_error(error: Exception) -> bool:
         "internal",
     ]
     return any(marker in message for marker in transient_markers)
+
+
+def is_gemini_quota_error(error: Exception) -> bool:
+    message = str(error).lower()
+    quota_markers = [
+        "resource_exhausted",
+        "exceeded your current quota",
+        "quota",
+        "billing",
+    ]
+    return any(marker in message for marker in quota_markers)
 
 
 def generate_gemini_content_with_retry(
@@ -78,7 +91,9 @@ def generate_gemini_content_with_retry(
 
 
 def show_gemini_busy_error(error: Exception) -> None:
-    if is_transient_gemini_error(error):
+    if is_gemini_quota_error(error):
+        st.error("Gemini API 配额或限流已触发。录音已保留，处理额度/账单后可以重新提交评分。")
+    elif is_transient_gemini_error(error):
         st.error("Gemini 当前繁忙，自动重试后仍未成功。录音已保留，可以稍后直接重新请求评分。")
     else:
         st.error("Gemini 请求失败。录音已保留，可以稍后直接重新请求评分。")
@@ -1087,6 +1102,11 @@ else:
                         st.session_state.pop(f"{qa_pending_key}_started_at", None)
                         status_box.update(label="本次评分未完成", state="error")
                         show_gemini_busy_error(e)
+                        if st.button(
+                            "重新提交本次录音评分",
+                            key=f"retry_submit_qa_{question}_{st.session_state[qa_key_name]}",
+                        ):
+                            submit_audio_for_scoring(qa_pending_key)
                 elif st.button(
                     "📤 提交本次录音评分",
                     type="primary",
@@ -1241,6 +1261,11 @@ else:
                         st.session_state.pop(f"{reading_pending_key}_started_at", None)
                         status_box.update(label="本次评分未完成", state="error")
                         show_gemini_busy_error(e)
+                        if st.button(
+                            "重新提交本次朗读评分",
+                            key=f"retry_submit_reading_{db_save_title}_{st.session_state[reading_key_name]}",
+                        ):
+                            submit_audio_for_scoring(reading_pending_key)
                 elif st.button(
                     "📤 提交本次朗读评分",
                     type="primary",
