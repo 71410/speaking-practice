@@ -12,6 +12,7 @@ from gtts import gTTS
 import base64
 import hashlib
 import io
+import time
 from openai import OpenAI
 import PyPDF2
 
@@ -42,6 +43,48 @@ client_admin = get_admin_client()
 client_voice = get_voice_client()
 supabase: Client = get_supabase_client()
 USER_DATABASE = st.secrets["passwords"]
+GEMINI_FLASH_MODEL = "gemini-3.5-flash"
+
+
+def is_transient_gemini_error(error: Exception) -> bool:
+    message = str(error).lower()
+    transient_markers = [
+        "503",
+        "unavailable",
+        "high demand",
+        "temporar",
+        "timeout",
+        "deadline",
+        "429",
+        "resource_exhausted",
+        "internal",
+    ]
+    return any(marker in message for marker in transient_markers)
+
+
+def generate_gemini_content_with_retry(
+    contents: list,
+    model: str = GEMINI_FLASH_MODEL,
+    retry_delays: tuple[int, ...] = (2, 5, 10),
+):
+    last_error = None
+    for attempt in range(len(retry_delays) + 1):
+        try:
+            return client_voice.models.generate_content(model=model, contents=contents)
+        except Exception as exc:
+            last_error = exc
+            if attempt >= len(retry_delays) or not is_transient_gemini_error(exc):
+                raise
+            time.sleep(retry_delays[attempt])
+    raise last_error
+
+
+def show_gemini_busy_error(error: Exception) -> None:
+    if is_transient_gemini_error(error):
+        st.error("Gemini 当前繁忙，自动重试后仍未成功。录音已保留，可以稍后直接重新请求评分。")
+    else:
+        st.error("Gemini 请求失败。录音已保留，可以稍后直接重新请求评分。")
+    st.caption(f"服务返回：{str(error)[:240]}")
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -169,8 +212,7 @@ def parse_writing_extract_json(raw_text: str) -> dict:
 
 
 def extract_writing_prompt_from_image(image_bytes: bytes) -> dict:
-    response = client_voice.models.generate_content(
-        model="gemini-3.5-flash",
+    response = generate_gemini_content_with_retry(
         contents=[
             genai_types.Part.from_bytes(
                 data=image_bytes,
@@ -386,10 +428,7 @@ def evaluate_writing_task1_gemini(
             )
         )
     contents.append(prompt)
-    response = client_voice.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=contents,
-    )
+    response = generate_gemini_content_with_retry(contents=contents)
     return response.text
 
 
@@ -964,7 +1003,9 @@ else:
                             3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
                             4. 【考官建议】：用中文给一段备考建议。
                             """
-                            response = client_voice.models.generate_content(model='gemini-3.5-flash', contents=[audio_file, prompt])
+                            response = generate_gemini_content_with_retry(
+                                contents=[audio_file, prompt]
+                            )
                             st.success("🎉 考官点评完成！")
                             st.markdown(response.text)
 
@@ -991,8 +1032,12 @@ else:
                             st.session_state[last_audio_tracker_qa] = audio_bytes_qa
                             
                         except Exception as e:
-                            st.error(f"Voice 引擎发生小意外：{e}")
-                        os.remove(tmp_file_path)
+                            show_gemini_busy_error(e)
+                            if st.button("重新请求本次录音评分", key=f"retry_qa_{question}_{st.session_state[qa_key_name]}"):
+                                st.rerun()
+                        finally:
+                            if os.path.exists(tmp_file_path):
+                                os.remove(tmp_file_path)
 
                 st.markdown("---")
                 if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
@@ -1087,7 +1132,9 @@ else:
                             3. 【语音语调（重音与连读）】：评价考生的意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然。
                             4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
                             """
-                            response = client_voice.models.generate_content(model='gemini-3.5-flash', contents=[audio_file, prompt])
+                            response = generate_gemini_content_with_retry(
+                                contents=[audio_file, prompt]
+                            )
                             st.success("🎉 发音诊断报告已生成！")
                             st.markdown(response.text)
                             st.balloons()
@@ -1102,8 +1149,12 @@ else:
                             st.session_state[last_audio_tracker_reading] = audio_bytes_reading
                             
                         except Exception as e:
-                            st.error(f"Voice 引擎发生小意外：{e}")
-                        os.remove(tmp_file_path)
+                            show_gemini_busy_error(e)
+                            if st.button("重新请求本次朗读评分", key=f"retry_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
+                                st.rerun()
+                        finally:
+                            if os.path.exists(tmp_file_path):
+                                os.remove(tmp_file_path)
 
                 st.markdown("---")
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
