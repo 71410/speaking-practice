@@ -113,6 +113,15 @@ def file_to_base64(uploaded_file) -> str:
     return base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def synthesize_tts_b64(text: str, tld: str = "co.uk") -> str:
+    sound_file = io.BytesIO()
+    tts = gTTS(text=text, lang="en", tld=tld)
+    tts.write_to_fp(sound_file)
+    sound_file.seek(0)
+    return base64.b64encode(sound_file.read()).decode()
+
+
 def base64_to_image_bytes(b64_str: str) -> bytes | None:
     if not b64_str or not str(b64_str).strip():
         return None
@@ -224,7 +233,7 @@ def get_admin_writing_content() -> str:
 def load_writing_tasks(task_type: str) -> list:
     response = (
         supabase.table("writing_bank")
-        .select("*")
+        .select("id, task_type, title, content")
         .eq("task_type", task_type)
         .order("id")
         .execute()
@@ -233,9 +242,32 @@ def load_writing_tasks(task_type: str) -> list:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
+def load_writing_task_detail(task_id: int) -> dict:
+    response = (
+        supabase.table("writing_bank")
+        .select("id, task_type, title, content, question_image")
+        .eq("id", task_id)
+        .limit(1)
+        .execute()
+    )
+    if response.data:
+        return response.data[0]
+    return {}
+
+
+def clear_writing_task_caches() -> None:
+    load_writing_tasks.clear()
+    load_writing_task_detail.clear()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_question_bank() -> dict:
     """加载完整口语题库，缓存 5 分钟。管理员上传新题后自动刷新。"""
-    response = supabase.table("question_bank").select("*").execute()
+    response = (
+        supabase.table("question_bank")
+        .select("part, theme, question_text")
+        .execute()
+    )
     bank: dict = {}
     for row in (response.data or []):
         p = row.get("part", "未分类")
@@ -252,7 +284,7 @@ def load_question_bank() -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def load_reading_bank() -> dict:
     """加载完整阅读材料库，缓存 5 分钟。"""
-    response = supabase.table("reading_bank").select("*").execute()
+    response = supabase.table("reading_bank").select("title, content").execute()
     return {row["title"]: row["content"] for row in (response.data or [])}
 
 
@@ -264,6 +296,7 @@ def load_practice_history(username: str, question: str) -> list:
         .select("record_text")
         .eq("username", username)
         .eq("question", question)
+        .limit(5)
         .execute()
     )
     return response.data or []
@@ -277,6 +310,7 @@ def load_reading_history(username: str, reading_title: str) -> list:
         .select("record_text")
         .eq("username", username)
         .eq("reading_title", reading_title)
+        .limit(5)
         .execute()
     )
     return response.data or []
@@ -291,6 +325,7 @@ def load_writing_history(username: str, task_id: int) -> list:
         .eq("username", username)
         .eq("task_id", task_id)
         .order("created_at", desc=True)
+        .limit(5)
         .execute()
     )
     return response.data or []
@@ -606,12 +641,16 @@ else:
                     if uploaded_file.name.endswith('.csv'):
                         with st.spinner("正在写入口语表格..."):
                             df = pd.read_csv(uploaded_file)
-                            for index, row in df.iterrows():
-                                supabase.table("question_bank").insert({
+                            rows = [
+                                {
                                     "part": str(row["part"]),
                                     "theme": str(row["theme"]),
-                                    "question_text": str(row["question"])
-                                }).execute()
+                                    "question_text": str(row["question"]),
+                                }
+                                for _, row in df.iterrows()
+                            ]
+                            if rows:
+                                supabase.table("question_bank").insert(rows).execute()
                         st.sidebar.success("✅ 口语 CSV 导入成功！")
                         load_question_bank.clear()
                     
@@ -646,12 +685,16 @@ else:
                                 if raw_text.endswith("```"): raw_text = raw_text[:-3]
                                 
                                 extracted_data = json.loads(raw_text.strip())
-                                for item in extracted_data:
-                                    supabase.table("question_bank").insert({
+                                rows = [
+                                    {
                                         "part": str(item.get("part", "未分类")),
                                         "theme": str(item.get("theme", "未分类")),
-                                        "question_text": str(item.get("question", "提取失败"))
-                                    }).execute()
+                                        "question_text": str(item.get("question", "提取失败")),
+                                    }
+                                    for item in extracted_data
+                                ]
+                                if rows:
+                                    supabase.table("question_bank").insert(rows).execute()
                                 st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 道口语题！")
                                 load_question_bank.clear()
                             except Exception as e:
@@ -666,11 +709,15 @@ else:
                         if uploaded_file.name.endswith('.csv'):
                             with st.spinner("正在写入阅读表格..."):
                                 df = pd.read_csv(uploaded_file)
-                                for index, row in df.iterrows():
-                                    supabase.table("reading_bank").insert({
+                                rows = [
+                                    {
                                         "title": str(row["title"]),
-                                        "content": str(row["content"])
-                                    }).execute()
+                                        "content": str(row["content"]),
+                                    }
+                                    for _, row in df.iterrows()
+                                ]
+                                if rows:
+                                    supabase.table("reading_bank").insert(rows).execute()
                             st.sidebar.success("✅ 阅读 CSV 导入成功！")
                             load_reading_bank.clear()
                         elif uploaded_file.name.endswith('.pdf'):
@@ -704,11 +751,15 @@ else:
                                     if raw_text.endswith("```"): raw_text = raw_text[:-3]
                                     
                                     extracted_data = json.loads(raw_text.strip())
-                                    for item in extracted_data:
-                                        supabase.table("reading_bank").insert({
+                                    rows = [
+                                        {
                                             "title": str(item.get("title", "未命名文章")),
-                                            "content": str(item.get("content", "内容提取失败"))
-                                        }).execute()
+                                            "content": str(item.get("content", "内容提取失败")),
+                                        }
+                                        for item in extracted_data
+                                    ]
+                                    if rows:
+                                        supabase.table("reading_bank").insert(rows).execute()
                                     st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 篇阅读文章！")
                                     load_reading_bank.clear()
                                 except Exception as e:
@@ -803,7 +854,7 @@ else:
                             "question_image": image_b64,
                         }).execute()
                     st.sidebar.success(f"✅ 已保存 {writing_task_type} 写作题！")
-                    load_writing_tasks.clear()
+                    clear_writing_task_caches()
                     reset_admin_writing_session_state()
                     st.session_state.admin_writing_uploader_gen += 1
                     st.rerun()
@@ -820,7 +871,7 @@ else:
             st.sidebar.success("✅ 阅读文章库已清空！")
         if st.sidebar.button("🚨 一键清空写作题库", type="primary"):
             supabase.table("writing_bank").delete().neq("id", 0).execute()
-            load_writing_tasks.clear()
+            clear_writing_task_caches()
             st.sidebar.success("✅ 写作题库已清空！")
     
     st.sidebar.markdown("---")
@@ -983,12 +1034,7 @@ else:
             
             if st.button("🎧 听专业播音员示范"):
                 with st.spinner("正在呼叫播音员..."):
-                    tts = gTTS(text=target_text, lang='en', tld='co.uk')
-                    sound_file = io.BytesIO()
-                    tts.write_to_fp(sound_file)
-                    sound_file.seek(0)
-                    
-                    b64 = base64.b64encode(sound_file.read()).decode()
+                    b64 = synthesize_tts_b64(target_text)
                     md = f"""
                         <audio controls autoplay style="width: 100%;">
                         <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
@@ -1092,8 +1138,12 @@ else:
                 format_func=_task_label,
                 key="writing_task_select",
             )
-            selected_task = tasks[selected_idx]
-            task_id = selected_task["id"]
+            selected_task_summary = tasks[selected_idx]
+            task_id = selected_task_summary["id"]
+            selected_task = {
+                **selected_task_summary,
+                **load_writing_task_detail(task_id),
+            }
             task_instructions = (
                 selected_task.get("content") or selected_task.get("title") or ""
             )
