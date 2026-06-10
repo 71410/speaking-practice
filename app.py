@@ -41,7 +41,7 @@ client_admin = get_admin_client()
 client_voice = get_voice_client()
 supabase: Client = get_supabase_client()
 USER_DATABASE = st.secrets["passwords"]
-GEMINI_FLASH_MODEL = "gemini-3.5-flash"
+GEMINI_FLASH_MODEL = "gemini-2.5-flash"
 
 
 def is_transient_gemini_error(error: Exception) -> bool:
