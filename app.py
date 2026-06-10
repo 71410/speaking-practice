@@ -100,6 +100,12 @@ def show_audio_payload_info(audio_bytes: bytes) -> None:
         st.warning("这段录音较大，评分可能明显变慢或失败。建议缩短录音或分成多段提交。")
 
 
+def submit_audio_for_scoring(pending_key: str) -> None:
+    st.session_state[pending_key] = True
+    st.session_state[f"{pending_key}_started_at"] = time.strftime("%H:%M:%S")
+    st.rerun()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def load_profile_information(username: str) -> str:
     response = (
@@ -1011,61 +1017,91 @@ else:
                 show_audio_payload_info(saved_audio_qa)
                 st.success("录音已保存。确认无误后点击下方按钮提交评分。")
                 last_audio_tracker_qa = f"last_audio_{question}"
+                qa_pending_key = f"pending_qa_{question}"
+                qa_answer_key = f"personalized_answer_{question}_{saved_audio_hash_qa}"
                 qa_already_scored = st.session_state.get(last_audio_tracker_qa) == saved_audio_hash_qa
 
                 if qa_already_scored:
                     st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
+                    if st.session_state.get(qa_answer_key):
+                        st.markdown("---")
+                        st.subheader("✨ 你的专属个性化答案")
+                        st.markdown(st.session_state[qa_answer_key])
+                    elif st.button(
+                        "✨ 生成专属参考答案",
+                        key=f"answer_qa_{question}_{st.session_state[qa_key_name]}",
+                    ):
+                        profile_info = load_profile_information(current_user)
+                        with st.spinner("正在根据你的个人档案定制专属答案..."):
+                            personalized_answer = generate_personalized_answer(
+                                question, profile_info
+                            )
+                        st.session_state[qa_answer_key] = personalized_answer
+                        st.markdown("---")
+                        st.subheader("✨ 你的专属个性化答案")
+                        if not profile_info.strip():
+                            st.caption(
+                                "你尚未填写个人档案，答案为通用示范。前往左侧「个人档案」填写后，答案将更贴合你的真实人设。"
+                            )
+                        st.markdown(personalized_answer)
+                elif st.session_state.get(qa_pending_key):
+                    status_box = st.status(
+                        "正在处理本次录音评分，请勿刷新页面",
+                        expanded=True,
+                    )
+                    qa_started_at = st.session_state.get(f"{qa_pending_key}_started_at", "刚刚")
+                    status_box.write(f"1/4 已收到提交。开始时间：{qa_started_at}")
+                    status_box.write("2/4 正在发送录音给 Gemini。")
+                    try:
+                        prompt = f"""
+                        你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
+                        请你：
+                        1. 【精准听写】：写下听到的英文原话。
+                        2. 【切题度与雅思预估分】：评价是否切题，给出预估分数。
+                        3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
+                        4. 【考官建议】：用中文给一段备考建议。
+                        """
+                        response = generate_gemini_content_with_retry(
+                            contents=[wav_audio_part(saved_audio_qa), prompt]
+                        )
+                        status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+                        st.success("🎉 考官点评完成！")
+                        st.markdown(response.text)
+
+                        status_box.write("4/4 正在保存历史记录。")
+                        supabase.table("practice_history").insert({
+                            "username": current_user,
+                            "question": question,
+                            "record_text": response.text
+                        }).execute()
+                        load_practice_history.clear()
+
+                        st.session_state[last_audio_tracker_qa] = saved_audio_hash_qa
+                        st.session_state[qa_pending_key] = False
+                        st.session_state.pop(f"{qa_pending_key}_started_at", None)
+                        status_box.update(label="本次录音评分完成", state="complete")
+                        st.info("如需专属参考答案，请点击下方按钮生成。")
+                        
+                    except Exception as e:
+                        st.session_state[qa_pending_key] = False
+                        st.session_state.pop(f"{qa_pending_key}_started_at", None)
+                        status_box.update(label="本次评分未完成", state="error")
+                        show_gemini_busy_error(e)
                 elif st.button(
                     "📤 提交本次录音评分",
                     type="primary",
                     key=f"submit_qa_{question}_{st.session_state[qa_key_name]}",
                 ):
-                    with st.spinner("🧠 专属考官 Voice 引擎正在仔细聆听..."):
-                        try:
-                            prompt = f"""
-                            你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
-                            请你：
-                            1. 【精准听写】：写下听到的英文原话。
-                            2. 【切题度与雅思预估分】：评价是否切题，给出预估分数。
-                            3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
-                            4. 【考官建议】：用中文给一段备考建议。
-                            """
-                            response = generate_gemini_content_with_retry(
-                                contents=[wav_audio_part(saved_audio_qa), prompt]
-                            )
-                            st.success("🎉 考官点评完成！")
-                            st.markdown(response.text)
-
-                            profile_info = load_profile_information(current_user)
-                            with st.spinner("✨ 正在根据你的个人档案定制专属答案..."):
-                                personalized_answer = generate_personalized_answer(
-                                    question, profile_info
-                                )
-                            st.markdown("---")
-                            st.subheader("✨ 你的专属个性化答案")
-                            if not profile_info.strip():
-                                st.caption(
-                                    "💡 你尚未填写个人档案，答案为通用示范。前往左侧「👤 个人档案」填写后，答案将更贴合你的真实人设。"
-                                )
-                            st.markdown(personalized_answer)
-                            
-                            supabase.table("practice_history").insert({
-                                "username": current_user,
-                                "question": question,
-                                "record_text": response.text
-                            }).execute()
-                            load_practice_history.clear()
-
-                            st.session_state[last_audio_tracker_qa] = saved_audio_hash_qa
-                            
-                        except Exception as e:
-                            show_gemini_busy_error(e)
+                    submit_audio_for_scoring(qa_pending_key)
 
                 st.markdown("---")
                 if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
                     st.session_state.pop(qa_audio_key, None)
                     st.session_state.pop(qa_audio_hash_key, None)
                     st.session_state.pop(last_audio_tracker_qa, None)
+                    st.session_state.pop(qa_answer_key, None)
+                    st.session_state.pop(qa_pending_key, None)
+                    st.session_state.pop(f"{qa_pending_key}_started_at", None)
                     st.session_state[qa_key_name] += 1
                     st.rerun()
 
@@ -1150,53 +1186,75 @@ else:
                 show_audio_payload_info(saved_audio_reading)
                 st.success("录音已保存。确认无误后点击下方按钮提交评分。")
                 last_audio_tracker_reading = f"last_audio_{db_save_title}"
+                reading_pending_key = f"pending_reading_{db_save_title}"
                 reading_already_scored = (
                     st.session_state.get(last_audio_tracker_reading) == saved_audio_hash_reading
                 )
 
                 if reading_already_scored:
                     st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
+                elif st.session_state.get(reading_pending_key):
+                    status_box = st.status(
+                        "正在处理本次朗读评分，请勿刷新页面",
+                        expanded=True,
+                    )
+                    reading_started_at = st.session_state.get(
+                        f"{reading_pending_key}_started_at",
+                        "刚刚",
+                    )
+                    status_box.write(f"1/4 已收到提交。开始时间：{reading_started_at}")
+                    status_box.write("2/4 正在发送录音给 Gemini。")
+                    try:
+                        prompt = f"""
+                        你现在是一名雅思口语考官兼流利度教练。考生正在朗读这段指定的文本：“{target_text}”
+                        我已经上传了考生的录音。
+                        请注意：**绝对不要纠结考生的口音是英式还是美式**，只要发音清晰即可。你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判。
+                        请严格按以下格式输出反馈：
+                        1. 【流利度与节奏】：评价朗读时的语速、停顿是否合理，有无不自然的卡顿、结巴或频繁的自我纠正。
+                        2. 【发音准确度（错词/漏词）】：精准指出他严重读错、漏读或多读的具体单词。
+                        3. 【语音语调（重音与连读）】：评价考生的意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然。
+                        4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
+                        """
+                        response = generate_gemini_content_with_retry(
+                            contents=[wav_audio_part(saved_audio_reading), prompt]
+                        )
+                        status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+                        st.success("🎉 发音诊断报告已生成！")
+                        st.markdown(response.text)
+                        st.balloons()
+                        
+                        status_box.write("4/4 正在保存历史记录。")
+                        supabase.table("reading_history").insert({
+                            "username": current_user,
+                            "reading_title": db_save_title,
+                            "record_text": response.text
+                        }).execute()
+                        load_reading_history.clear()
+
+                        st.session_state[last_audio_tracker_reading] = saved_audio_hash_reading
+                        st.session_state[reading_pending_key] = False
+                        st.session_state.pop(f"{reading_pending_key}_started_at", None)
+                        status_box.update(label="本次朗读评分完成", state="complete")
+                        
+                    except Exception as e:
+                        st.session_state[reading_pending_key] = False
+                        st.session_state.pop(f"{reading_pending_key}_started_at", None)
+                        status_box.update(label="本次评分未完成", state="error")
+                        show_gemini_busy_error(e)
                 elif st.button(
                     "📤 提交本次朗读评分",
                     type="primary",
                     key=f"submit_reading_{db_save_title}_{st.session_state[reading_key_name]}",
                 ):
-                    with st.spinner("🧠 专属教练 Voice 引擎正在评估..."):
-                        try:
-                            prompt = f"""
-                            你现在是一名雅思口语考官兼流利度教练。考生正在朗读这段指定的文本：“{target_text}”
-                            我已经上传了考生的录音。
-                            请注意：**绝对不要纠结考生的口音是英式还是美式**，只要发音清晰即可。你的重点是按照雅思口语的发音（PR）和流利度（FC）标准来进行严苛评判。
-                            请严格按以下格式输出反馈：
-                            1. 【流利度与节奏】：评价朗读时的语速、停顿是否合理，有无不自然的卡顿、结巴或频繁的自我纠正。
-                            2. 【发音准确度（错词/漏词）】：精准指出他严重读错、漏读或多读的具体单词。
-                            3. 【语音语调（重音与连读）】：评价考生的意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然。
-                            4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
-                            """
-                            response = generate_gemini_content_with_retry(
-                                contents=[wav_audio_part(saved_audio_reading), prompt]
-                            )
-                            st.success("🎉 发音诊断报告已生成！")
-                            st.markdown(response.text)
-                            st.balloons()
-                            
-                            supabase.table("reading_history").insert({
-                                "username": current_user,
-                                "reading_title": db_save_title,
-                                "record_text": response.text
-                            }).execute()
-                            load_reading_history.clear()
-
-                            st.session_state[last_audio_tracker_reading] = saved_audio_hash_reading
-                            
-                        except Exception as e:
-                            show_gemini_busy_error(e)
+                    submit_audio_for_scoring(reading_pending_key)
 
                 st.markdown("---")
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
                     st.session_state.pop(reading_audio_key, None)
                     st.session_state.pop(reading_audio_hash_key, None)
                     st.session_state.pop(last_audio_tracker_reading, None)
+                    st.session_state.pop(reading_pending_key, None)
+                    st.session_state.pop(f"{reading_pending_key}_started_at", None)
                     st.session_state[reading_key_name] += 1
                     st.rerun()
 
