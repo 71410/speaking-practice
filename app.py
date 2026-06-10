@@ -89,6 +89,10 @@ def wav_audio_part(audio_bytes: bytes):
     return genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/wav")
 
 
+def audio_fingerprint(audio_bytes: bytes) -> str:
+    return hashlib.md5(audio_bytes).hexdigest()
+
+
 def show_audio_payload_info(audio_bytes: bytes) -> None:
     size_mb = len(audio_bytes) / 1024 / 1024
     st.caption(f"录音大小：{size_mb:.2f} MB。2 分钟内通常可以提交；如果超过 15 MB，建议分段练习。")
@@ -993,11 +997,21 @@ else:
                 key=f"recorder_qa_{question}_{st.session_state[qa_key_name]}"
             )
 
+            qa_audio_key = f"audio_qa_{question}"
+            qa_audio_hash_key = f"audio_hash_qa_{question}"
             if audio_bytes_qa:
-                st.audio(audio_bytes_qa, format="audio/wav")
-                show_audio_payload_info(audio_bytes_qa)
+                st.session_state[qa_audio_key] = audio_bytes_qa
+                st.session_state[qa_audio_hash_key] = audio_fingerprint(audio_bytes_qa)
+
+            saved_audio_qa = st.session_state.get(qa_audio_key)
+            saved_audio_hash_qa = st.session_state.get(qa_audio_hash_key, "")
+
+            if saved_audio_qa:
+                st.audio(saved_audio_qa, format="audio/wav")
+                show_audio_payload_info(saved_audio_qa)
+                st.success("录音已保存。确认无误后点击下方按钮提交评分。")
                 last_audio_tracker_qa = f"last_audio_{question}"
-                qa_already_scored = st.session_state.get(last_audio_tracker_qa) == audio_bytes_qa
+                qa_already_scored = st.session_state.get(last_audio_tracker_qa) == saved_audio_hash_qa
 
                 if qa_already_scored:
                     st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
@@ -1017,7 +1031,7 @@ else:
                             4. 【考官建议】：用中文给一段备考建议。
                             """
                             response = generate_gemini_content_with_retry(
-                                contents=[wav_audio_part(audio_bytes_qa), prompt]
+                                contents=[wav_audio_part(saved_audio_qa), prompt]
                             )
                             st.success("🎉 考官点评完成！")
                             st.markdown(response.text)
@@ -1042,13 +1056,16 @@ else:
                             }).execute()
                             load_practice_history.clear()
 
-                            st.session_state[last_audio_tracker_qa] = audio_bytes_qa
+                            st.session_state[last_audio_tracker_qa] = saved_audio_hash_qa
                             
                         except Exception as e:
                             show_gemini_busy_error(e)
 
                 st.markdown("---")
                 if st.button("🔄 不满意？清除录音，再练一次！", key=f"btn_qa_{question}_{st.session_state[qa_key_name]}"):
+                    st.session_state.pop(qa_audio_key, None)
+                    st.session_state.pop(qa_audio_hash_key, None)
+                    st.session_state.pop(last_audio_tracker_qa, None)
                     st.session_state[qa_key_name] += 1
                     st.rerun()
 
@@ -1119,12 +1136,22 @@ else:
                 key=f"recorder_reading_{db_save_title}_{st.session_state[reading_key_name]}"
             )
 
+            reading_audio_key = f"audio_reading_{db_save_title}"
+            reading_audio_hash_key = f"audio_hash_reading_{db_save_title}"
             if audio_bytes_reading:
-                st.audio(audio_bytes_reading, format="audio/wav")
-                show_audio_payload_info(audio_bytes_reading)
+                st.session_state[reading_audio_key] = audio_bytes_reading
+                st.session_state[reading_audio_hash_key] = audio_fingerprint(audio_bytes_reading)
+
+            saved_audio_reading = st.session_state.get(reading_audio_key)
+            saved_audio_hash_reading = st.session_state.get(reading_audio_hash_key, "")
+
+            if saved_audio_reading:
+                st.audio(saved_audio_reading, format="audio/wav")
+                show_audio_payload_info(saved_audio_reading)
+                st.success("录音已保存。确认无误后点击下方按钮提交评分。")
                 last_audio_tracker_reading = f"last_audio_{db_save_title}"
                 reading_already_scored = (
-                    st.session_state.get(last_audio_tracker_reading) == audio_bytes_reading
+                    st.session_state.get(last_audio_tracker_reading) == saved_audio_hash_reading
                 )
 
                 if reading_already_scored:
@@ -1147,7 +1174,7 @@ else:
                             4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
                             """
                             response = generate_gemini_content_with_retry(
-                                contents=[wav_audio_part(audio_bytes_reading), prompt]
+                                contents=[wav_audio_part(saved_audio_reading), prompt]
                             )
                             st.success("🎉 发音诊断报告已生成！")
                             st.markdown(response.text)
@@ -1160,13 +1187,16 @@ else:
                             }).execute()
                             load_reading_history.clear()
 
-                            st.session_state[last_audio_tracker_reading] = audio_bytes_reading
+                            st.session_state[last_audio_tracker_reading] = saved_audio_hash_reading
                             
                         except Exception as e:
                             show_gemini_busy_error(e)
 
                 st.markdown("---")
                 if st.button("🔄 感觉没读顺？清除录音，重读本句！", key=f"btn_reading_{db_save_title}_{st.session_state[reading_key_name]}"):
+                    st.session_state.pop(reading_audio_key, None)
+                    st.session_state.pop(reading_audio_hash_key, None)
+                    st.session_state.pop(last_audio_tracker_reading, None)
                     st.session_state[reading_key_name] += 1
                     st.rerun()
 
