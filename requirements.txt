@@ -1,5 +1,5 @@
-streamlit
-audio-recorder-streamlit
+streamlit==1.55.0
+audio-recorder-streamlit==0.0.10
 google-genai
 supabase
 pandas

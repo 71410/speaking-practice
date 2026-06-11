@@ -9,30 +9,34 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Gravity;
-import android.view.View;
+import android.webkit.PermissionRequest;
+import android.webkit.ValueCallback;
+import android.webkit.WebChromeClient;
+import android.webkit.WebResourceError;
+import android.webkit.WebResourceRequest;
+import android.webkit.WebSettings;
+import android.webkit.WebView;
+import android.webkit.WebViewClient;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
-
-import org.mozilla.geckoview.GeckoRuntime;
-import org.mozilla.geckoview.GeckoSession;
-import org.mozilla.geckoview.GeckoView;
 
 public class MainActivity extends Activity {
     private static final String APP_URL =
         "https://speaking-practice-bhpcjdevjsrfpx99jckqpy.streamlit.app/";
     private static final int AUDIO_PERMISSION_REQUEST = 1000;
+    private static final int FILE_CHOOSER_REQUEST = 1001;
 
-    private GeckoSession geckoSession;
-    private GeckoView geckoView;
-    private boolean canGoBack = false;
+    private WebView webView;
+    private ValueCallback<Uri[]> filePathCallback;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         requestAudioPermissionIfNeeded();
         buildLayout();
-        startGecko();
+        configureWebView();
+        webView.loadUrl(APP_URL);
     }
 
     private void buildLayout() {
@@ -50,14 +54,12 @@ public class MainActivity extends Activity {
         title.setTextColor(Color.rgb(29, 38, 33));
         title.setTextSize(16);
         title.setGravity(Gravity.CENTER_VERTICAL);
-        toolbar.addView(
-            title,
-            new LinearLayout.LayoutParams(
-                0,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                1
-            )
+        LinearLayout.LayoutParams titleParams = new LinearLayout.LayoutParams(
+            0,
+            LinearLayout.LayoutParams.WRAP_CONTENT,
+            1
         );
+        toolbar.addView(title, titleParams);
 
         Button browserButton = new Button(this);
         browserButton.setText("浏览器打开");
@@ -65,10 +67,10 @@ public class MainActivity extends Activity {
         browserButton.setOnClickListener(view -> openInBrowser());
         toolbar.addView(browserButton);
 
-        geckoView = new GeckoView(this);
+        webView = new WebView(this);
         root.addView(toolbar);
         root.addView(
-            geckoView,
+            webView,
             new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 0,
@@ -78,18 +80,77 @@ public class MainActivity extends Activity {
         setContentView(root);
     }
 
-    private void startGecko() {
-        GeckoRuntime runtime = GeckoRuntime.create(this);
-        geckoSession = new GeckoSession();
-        geckoSession.setNavigationDelegate(new GeckoSession.NavigationDelegate() {
+    private void configureWebView() {
+        WebView.setWebContentsDebuggingEnabled(true);
+        WebSettings settings = webView.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        settings.setMediaPlaybackRequiresUserGesture(false);
+        settings.setJavaScriptCanOpenWindowsAutomatically(true);
+        settings.setLoadWithOverviewMode(true);
+        settings.setUseWideViewPort(true);
+        settings.setSupportZoom(false);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
+        }
+
+        webView.setWebViewClient(new WebViewClient() {
             @Override
-            public void onCanGoBack(GeckoSession session, boolean canGoBack) {
-                MainActivity.this.canGoBack = canGoBack;
+            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                return false;
+            }
+
+            @Override
+            public void onReceivedError(
+                WebView view,
+                WebResourceRequest request,
+                WebResourceError error
+            ) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && request.isForMainFrame()) {
+                    showErrorPage(error.getDescription().toString());
+                }
             }
         });
-        geckoSession.open(runtime);
-        geckoView.setSession(geckoSession);
-        geckoSession.loadUri(APP_URL);
+
+        webView.setWebChromeClient(new WebChromeClient() {
+            @Override
+            public void onPermissionRequest(PermissionRequest request) {
+                runOnUiThread(() -> request.grant(request.getResources()));
+            }
+
+            @Override
+            public boolean onShowFileChooser(
+                WebView webView,
+                ValueCallback<Uri[]> filePathCallback,
+                WebChromeClient.FileChooserParams fileChooserParams
+            ) {
+                if (MainActivity.this.filePathCallback != null) {
+                    MainActivity.this.filePathCallback.onReceiveValue(null);
+                }
+                MainActivity.this.filePathCallback = filePathCallback;
+                try {
+                    startActivityForResult(
+                        fileChooserParams.createIntent(),
+                        FILE_CHOOSER_REQUEST
+                    );
+                    return true;
+                } catch (Exception e) {
+                    MainActivity.this.filePathCallback = null;
+                    return false;
+                }
+            }
+        });
+    }
+
+    private void showErrorPage(String reason) {
+        String html = "<html><body style='font-family:sans-serif;padding:24px;'>"
+            + "<h2>页面暂时没有加载成功</h2>"
+            + "<p>请检查网络，或点击顶部“浏览器打开”。</p>"
+            + "<p style='color:#666;font-size:13px;'>"
+            + reason
+            + "</p></body></html>";
+        webView.loadDataWithBaseURL(null, html, "text/html", "UTF-8", null);
     }
 
     private void requestAudioPermissionIfNeeded() {
@@ -112,18 +173,28 @@ public class MainActivity extends Activity {
 
     @Override
     public void onBackPressed() {
-        if (geckoSession != null && canGoBack) {
-            geckoSession.goBack();
+        if (webView != null && webView.canGoBack()) {
+            webView.goBack();
         } else {
             super.onBackPressed();
         }
     }
 
     @Override
-    protected void onDestroy() {
-        if (geckoSession != null) {
-            geckoSession.close();
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != FILE_CHOOSER_REQUEST || filePathCallback == null) {
+            return;
         }
-        super.onDestroy();
+
+        Uri[] results = null;
+        if (resultCode == RESULT_OK && data != null) {
+            Uri dataUri = data.getData();
+            if (dataUri != null) {
+                results = new Uri[] { dataUri };
+            }
+        }
+        filePathCallback.onReceiveValue(results);
+        filePathCallback = null;
     }
 }
