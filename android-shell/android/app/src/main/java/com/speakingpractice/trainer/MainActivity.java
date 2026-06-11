@@ -81,7 +81,13 @@ public class MainActivity extends Activity {
         toolbar.addView(browserButton);
 
         webView = new WebView(this);
-        root.addView(toolbar);
+        root.addView(
+            toolbar,
+            new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                dp(56)
+            )
+        );
         root.addView(
             webView,
             new LinearLayout.LayoutParams(
@@ -91,6 +97,10 @@ public class MainActivity extends Activity {
             )
         );
         setContentView(root);
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
     }
 
     private void configureWebView() {
