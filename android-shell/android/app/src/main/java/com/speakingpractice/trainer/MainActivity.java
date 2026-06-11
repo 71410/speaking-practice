@@ -41,7 +41,7 @@ public class MainActivity extends Activity {
             + "if(typeof AbortSignal!=='undefined'&&!AbortSignal.timeout){AbortSignal.timeout=function(ms){var c=new AbortController();setTimeout(function(){c.abort()},ms);return c.signal}};\n";
     private static final String STREAMLIT_CLOUD_HEIGHT_FIX =
         "(function(){"
-            + "function applyAndroidHeightFix(){"
+            + "window.__applyAndroidHeightFix=function(){"
             + "document.documentElement.style.height='100%';"
             + "document.documentElement.style.minHeight='100%';"
             + "document.body.style.margin='0';"
@@ -62,10 +62,16 @@ public class MainActivity extends Activity {
             + "}"
             + "}"
             + "window.dispatchEvent(new Event('resize'));"
+            + "};"
+            + "window.__applyAndroidHeightFix();"
+            + "if(!window.__androidHeightFixTimer){"
+            + "var attempts=0;"
+            + "window.__androidHeightFixTimer=setInterval(function(){"
+            + "window.__applyAndroidHeightFix();"
+            + "attempts+=1;"
+            + "if(attempts>=60){clearInterval(window.__androidHeightFixTimer);window.__androidHeightFixTimer=null;}"
+            + "},500);"
             + "}"
-            + "applyAndroidHeightFix();"
-            + "setTimeout(applyAndroidHeightFix,250);"
-            + "setTimeout(applyAndroidHeightFix,1000);"
             + "})();";
 
     private WebView webView;
