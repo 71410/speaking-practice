@@ -39,6 +39,34 @@ public class MainActivity extends Activity {
     private static final String WEBVIEW_POLYFILLS =
         "if(!Object.hasOwn){Object.hasOwn=function(o,p){return Object.prototype.hasOwnProperty.call(Object(o),p)}};"
             + "if(typeof AbortSignal!=='undefined'&&!AbortSignal.timeout){AbortSignal.timeout=function(ms){var c=new AbortController();setTimeout(function(){c.abort()},ms);return c.signal}};\n";
+    private static final String STREAMLIT_CLOUD_HEIGHT_FIX =
+        "(function(){"
+            + "function applyAndroidHeightFix(){"
+            + "document.documentElement.style.height='100%';"
+            + "document.documentElement.style.minHeight='100%';"
+            + "document.body.style.margin='0';"
+            + "document.body.style.height='100%';"
+            + "document.body.style.minHeight='100%';"
+            + "document.body.style.overflow='auto';"
+            + "var root=document.getElementById('root');"
+            + "if(root){root.style.height='100%';root.style.minHeight='100%';}"
+            + "var frame=document.querySelector('iframe[src*=\"~/+/\"]');"
+            + "if(frame){"
+            + "var el=frame;"
+            + "while(el&&el!==document.body){"
+            + "el.style.height='100vh';"
+            + "el.style.minHeight='100vh';"
+            + "el.style.width='100%';"
+            + "if(el.tagName==='IFRAME'){el.style.border='0';el.style.display='block';}"
+            + "el=el.parentElement;"
+            + "}"
+            + "}"
+            + "window.dispatchEvent(new Event('resize'));"
+            + "}"
+            + "applyAndroidHeightFix();"
+            + "setTimeout(applyAndroidHeightFix,250);"
+            + "setTimeout(applyAndroidHeightFix,1000);"
+            + "})();";
 
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
@@ -127,6 +155,11 @@ public class MainActivity extends Activity {
             }
 
             @Override
+            public void onPageFinished(WebView view, String url) {
+                injectPostLoadFixes(view);
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return false;
             }
@@ -190,6 +223,12 @@ public class MainActivity extends Activity {
     private void injectPolyfills(WebView view) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
             view.evaluateJavascript(WEBVIEW_POLYFILLS, null);
+        }
+    }
+
+    private void injectPostLoadFixes(WebView view) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            view.evaluateJavascript(WEBVIEW_POLYFILLS + STREAMLIT_CLOUD_HEIGHT_FIX, null);
         }
     }
 
