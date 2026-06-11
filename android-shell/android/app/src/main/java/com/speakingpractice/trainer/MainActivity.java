@@ -17,15 +17,28 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebResourceResponse;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+
 public class MainActivity extends Activity {
     private static final String APP_URL =
         "https://speaking-practice-bhpcjdevjsrfpx99jckqpy.streamlit.app/";
+    private static final String APP_HOST =
+        "speaking-practice-bhpcjdevjsrfpx99jckqpy.streamlit.app";
     private static final int AUDIO_PERMISSION_REQUEST = 1000;
     private static final int FILE_CHOOSER_REQUEST = 1001;
+    private static final String WEBVIEW_POLYFILLS =
+        "if(!Object.hasOwn){Object.hasOwn=function(o,p){return Object.prototype.hasOwnProperty.call(Object(o),p)}};"
+            + "if(typeof AbortSignal!=='undefined'&&!AbortSignal.timeout){AbortSignal.timeout=function(ms){var c=new AbortController();setTimeout(function(){c.abort()},ms);return c.signal}};\n";
 
     private WebView webView;
     private ValueCallback<Uri[]> filePathCallback;
@@ -91,14 +104,35 @@ public class MainActivity extends Activity {
         settings.setLoadWithOverviewMode(true);
         settings.setUseWideViewPort(true);
         settings.setSupportZoom(false);
+        settings.setCacheMode(WebSettings.LOAD_NO_CACHE);
+        webView.clearCache(true);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             settings.setMixedContentMode(WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE);
         }
 
         webView.setWebViewClient(new WebViewClient() {
             @Override
+            public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
+                injectPolyfills(view);
+            }
+
+            @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 return false;
+            }
+
+            @Override
+            public WebResourceResponse shouldInterceptRequest(
+                WebView view,
+                WebResourceRequest request
+            ) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                    WebResourceResponse patched = patchJavaScriptResponse(request);
+                    if (patched != null) {
+                        return patched;
+                    }
+                }
+                return super.shouldInterceptRequest(view, request);
             }
 
             @Override
@@ -141,6 +175,61 @@ public class MainActivity extends Activity {
                 }
             }
         });
+    }
+
+    private void injectPolyfills(WebView view) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            view.evaluateJavascript(WEBVIEW_POLYFILLS, null);
+        }
+    }
+
+    private WebResourceResponse patchJavaScriptResponse(WebResourceRequest request) {
+        try {
+            Uri uri = request.getUrl();
+            if (
+                uri == null
+                    || !APP_HOST.equals(uri.getHost())
+                    || uri.getPath() == null
+                    || !uri.getPath().endsWith(".js")
+            ) {
+                return null;
+            }
+
+            URL url = new URL(uri.toString());
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(15000);
+            connection.setReadTimeout(30000);
+            connection.setRequestProperty("Cache-Control", "no-cache");
+
+            try (InputStream input = connection.getInputStream()) {
+                byte[] original = readAllBytes(input);
+                byte[] prefix = WEBVIEW_POLYFILLS.getBytes(StandardCharsets.UTF_8);
+                ByteArrayOutputStream output = new ByteArrayOutputStream(
+                    prefix.length + original.length
+                );
+                output.write(prefix);
+                output.write(original);
+                return new WebResourceResponse(
+                    "application/javascript",
+                    "UTF-8",
+                    new ByteArrayInputStream(output.toByteArray())
+                );
+            } finally {
+                connection.disconnect();
+            }
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private byte[] readAllBytes(InputStream input) throws java.io.IOException {
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        byte[] buffer = new byte[8192];
+        int read;
+        while ((read = input.read(buffer)) != -1) {
+            output.write(buffer, 0, read);
+        }
+        return output.toByteArray();
     }
 
     private void showErrorPage(String reason) {
