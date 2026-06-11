@@ -7,6 +7,9 @@ on:
       - "android-shell/**"
       - ".github/workflows/build-android-apk.yml"
 
+permissions:
+  contents: write
+
 jobs:
   build-debug-apk:
     runs-on: ubuntu-latest
@@ -55,3 +58,16 @@ jobs:
         with:
           name: ielts-trainer-debug-apk
           path: android-shell/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Create downloadable debug APK release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: android-debug-${{ github.sha }}
+          name: Android Debug APK ${{ github.sha }}
+          prerelease: true
+          files: android-shell/android/app/build/outputs/apk/debug/app-debug.apk
+          body: |
+            Debug APK for internal Android testing.
+
+            This APK opens the hosted Streamlit app:
+            https://speaking-practice-bhpcjdevjsrfpx99jckqpy.streamlit.app/
