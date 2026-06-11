@@ -3,6 +3,7 @@ apply plugin: 'com.android.application'
 android {
     namespace = "com.speakingpractice.trainer"
     compileSdk = rootProject.ext.compileSdkVersion
+    ndkVersion "27.3.13750724"
     defaultConfig {
         applicationId "com.speakingpractice.trainer"
         minSdkVersion rootProject.ext.minSdkVersion
@@ -15,11 +16,22 @@ android {
              // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
             ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
         }
+        externalNativeBuild {
+            cmake {
+                abiFilters "arm64-v8a", "armeabi-v7a", "x86", "x86_64"
+            }
+        }
     }
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+        }
+    }
+    externalNativeBuild {
+        cmake {
+            path "src/main/cpp/CMakeLists.txt"
+            version "3.22.1"
         }
     }
 }
