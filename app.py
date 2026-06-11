@@ -42,6 +42,18 @@ client_voice = get_voice_client()
 supabase: Client = get_supabase_client()
 USER_DATABASE = st.secrets["passwords"]
 GEMINI_FLASH_MODEL = "gemini-2.5-flash"
+NAV_PAGES = [
+    "🏠 训练台",
+    "🗣️ 模拟考官",
+    "📖 英文原版朗读纠音",
+    "✍️ 雅思写作练习",
+    "👤 个人档案",
+]
+
+
+def request_page_change(page_name: str) -> None:
+    st.session_state.requested_page = page_name
+    st.rerun()
 
 
 def is_transient_gemini_error(error: Exception) -> bool:
@@ -205,6 +217,87 @@ def generate_personalized_answer(question: str, profile_info: str) -> str:
 
 def count_words(text: str) -> int:
     return len(re.findall(r"\b[\w'-]+\b", text.strip()))
+
+
+def writing_fingerprint(task_id: int, essay: str) -> str:
+    normalized = " ".join(essay.strip().split())
+    return hashlib.md5(f"{task_id}:{normalized}".encode("utf-8")).hexdigest()
+
+
+def split_markdown_sections(markdown_text: str) -> list[tuple[str, str]]:
+    sections: list[tuple[str, list[str]]] = []
+    current_title = "快速结论"
+    current_lines: list[str] = []
+
+    for line in markdown_text.splitlines():
+        if line.startswith("## "):
+            if current_lines:
+                sections.append((current_title, current_lines))
+            current_title = line.lstrip("#").strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines or not sections:
+        sections.append((current_title, current_lines))
+
+    return [(title, "\n".join(lines).strip()) for title, lines in sections if "\n".join(lines).strip()]
+
+
+def render_writing_evaluation_result(evaluation: str, unsafe_allow_html: bool) -> None:
+    st.subheader("✅ 批改结果")
+    sections = split_markdown_sections(evaluation)
+
+    if len(sections) <= 1:
+        st.markdown(evaluation, unsafe_allow_html=unsafe_allow_html)
+        return
+
+    for index, (title, body) in enumerate(sections):
+        expanded = index == 0 or "总评" in title or "总分" in title or "Overall" in title
+        with st.expander(title, expanded=expanded):
+            st.markdown(body, unsafe_allow_html=unsafe_allow_html)
+
+
+def render_training_dashboard(current_user: str) -> None:
+    st.subheader("今天想练什么？")
+    st.caption("从一个模块开始就好。训练过程中录音、作文和批改结果都会尽量保留在当前会话里。")
+
+    question_bank = load_question_bank()
+    reading_bank = load_reading_bank()
+    task1_count = len(load_writing_tasks("Task 1"))
+    task2_count = len(load_writing_tasks("Task 2"))
+    profile_filled = bool(load_profile_information(current_user).strip())
+
+    col_speaking, col_reading, col_writing = st.columns(3)
+
+    with col_speaking:
+        question_count = sum(
+            len(questions)
+            for themes in question_bank.values()
+            for questions in themes.values()
+        )
+        st.markdown("#### 🗣️ 模拟考官")
+        st.caption(f"题库：{question_count} 道题")
+        if st.button("开始口语训练", type="primary", use_container_width=True):
+            request_page_change("🗣️ 模拟考官")
+
+    with col_reading:
+        st.markdown("#### 📖 朗读纠音")
+        st.caption(f"材料：{len(reading_bank)} 篇")
+        if st.button("开始朗读训练", type="primary", use_container_width=True):
+            request_page_change("📖 英文原版朗读纠音")
+
+    with col_writing:
+        st.markdown("#### ✍️ 写作批改")
+        st.caption(f"Task 1：{task1_count} 题｜Task 2：{task2_count} 题")
+        if st.button("开始写作练习", type="primary", use_container_width=True):
+            request_page_change("✍️ 雅思写作练习")
+
+    st.markdown("---")
+    profile_status = "已填写" if profile_filled else "未填写"
+    st.info(f"个人档案：{profile_status}。档案会用于生成更贴近你自己的口语参考答案。")
+    if st.button("查看或修改个人档案"):
+        request_page_change("👤 个人档案")
 
 
 def file_to_base64(uploaded_file) -> str:
@@ -710,6 +803,7 @@ if not st.session_state.logged_in:
         if username in USER_DATABASE and USER_DATABASE[username] == password:
             st.session_state.logged_in = True
             st.session_state.current_user = username
+            st.session_state.current_page = "🏠 训练台"
             st.success(f"登录成功！欢迎回来，{username}！")
             st.rerun()
         else:
@@ -717,6 +811,11 @@ if not st.session_state.logged_in:
 
 else:
     current_user = st.session_state.current_user
+    if st.session_state.get("requested_page") in NAV_PAGES:
+        st.session_state.current_page = st.session_state.pop("requested_page")
+    if st.session_state.get("current_page") not in NAV_PAGES:
+        st.session_state.current_page = "🏠 训练台"
+
     st.sidebar.write(f"👤 当前练习者：**{current_user}**")
     
     # --- 👑 管理员后台 (DeepSeek 接管 PDF 解析) ---
@@ -955,15 +1054,35 @@ else:
 
         st.sidebar.markdown("---")
         st.sidebar.subheader(" 危险操作区")
-        if st.sidebar.button("🚨 一键清空口语题库", type="primary"):
+        danger_confirm = st.sidebar.text_input(
+            "输入 DELETE 才能启用清空按钮",
+            key="admin_danger_confirm",
+        )
+        danger_confirmed = danger_confirm.strip() == "DELETE"
+        if not danger_confirmed:
+            st.sidebar.caption("清空操作不可恢复，请确认已备份题库。")
+
+        if st.sidebar.button(
+            "🚨 一键清空口语题库",
+            type="primary",
+            disabled=not danger_confirmed,
+        ):
             supabase.table("question_bank").delete().neq("id", 0).execute()
             load_question_bank.clear()
             st.sidebar.success("✅ 口语题库已清空！")
-        if st.sidebar.button("🚨 一键清空阅读文章", type="primary"):
+        if st.sidebar.button(
+            "🚨 一键清空阅读文章",
+            type="primary",
+            disabled=not danger_confirmed,
+        ):
             supabase.table("reading_bank").delete().neq("id", 0).execute()
             load_reading_bank.clear()
             st.sidebar.success("✅ 阅读文章库已清空！")
-        if st.sidebar.button("🚨 一键清空写作题库", type="primary"):
+        if st.sidebar.button(
+            "🚨 一键清空写作题库",
+            type="primary",
+            disabled=not danger_confirmed,
+        ):
             supabase.table("writing_bank").delete().neq("id", 0).execute()
             clear_writing_task_caches()
             st.sidebar.success("✅ 写作题库已清空！")
@@ -971,16 +1090,13 @@ else:
     st.sidebar.markdown("---")
     page = st.sidebar.radio(
         "📍 功能导航",
-        [
-            "🗣️ 模拟考官",
-            "📖 英文原版朗读纠音",
-            "✍️ 雅思写作练习",
-            "👤 个人档案",
-        ],
+        NAV_PAGES,
+        key="current_page",
     )
     if st.sidebar.button("🚪 退出登录"):
         st.session_state.logged_in = False
         st.session_state.current_user = ""
+        st.session_state.pop("requested_page", None)
         st.rerun()
 
     st.title("专属英语训练舱 🚀")
@@ -988,7 +1104,10 @@ else:
     # ==========================================
     # 个人档案
     # ==========================================
-    if page == "👤 个人档案":
+    if page == "🏠 训练台":
+        render_training_dashboard(current_user)
+
+    elif page == "👤 个人档案":
         st.subheader("👤 个人档案")
         saved_info = load_profile_information(current_user)
         profile_text = st.text_area(
@@ -1351,54 +1470,127 @@ else:
 
             st.write("---")
             st.subheader("✍️ Step 2: 开始写作")
-            st.caption(f"建议字数：{word_target} 词（{writing_task_type}）")
+            st.caption(f"建议字数：{word_target} 词（{writing_task_type}）。草稿会保存在当前浏览器会话中，切换回来不会立刻丢失。")
 
+            draft_key = f"writing_textarea_{task_id}"
             user_essay = st.text_area(
                 "在此输入你的作文（英文）",
                 height=350,
-                key=f"writing_textarea_{task_id}",
+                key=draft_key,
             )
             word_count = count_words(user_essay)
+            st.progress(min(word_count / word_target, 1.0))
             if word_count < word_target:
                 st.warning(f"📏 当前字数：**{word_count}** / 建议 {word_target} 词（尚未达标）")
             else:
                 st.success(f"📏 当前字数：**{word_count}** / 建议 {word_target} 词（已达标 ✅）")
 
-            if st.button("📤 提交批改", type="primary", key=f"btn_submit_writing_{task_id}"):
-                if not user_essay.strip():
-                    st.error("请先输入作文内容再提交。")
-                else:
-                    is_task1 = writing_task_type == "Task 1"
-                    spinner_msg = (
-                        "👁️ Gemini 视觉引擎正在看图并批改..."
-                        if is_task1
-                        else "🧠 DeepSeek 推理引擎正在深度剖析大作文..."
-                    )
-                    with st.spinner(spinner_msg):
-                        try:
-                            evaluation = route_writing_evaluation(
-                                writing_task_type,
-                                selected_task["title"],
-                                task_instructions,
-                                selected_task.get("question_image"),
-                                user_essay.strip(),
-                            )
-                            st.success("🎉 批改完成！")
-                            st.markdown(
-                                evaluation,
-                                unsafe_allow_html=not is_task1,
-                            )
+            is_task1 = writing_task_type == "Task 1"
+            unsafe_writing_markdown = not is_task1
+            current_essay_hash = (
+                writing_fingerprint(task_id, user_essay)
+                if user_essay.strip()
+                else ""
+            )
+            writing_pending_key = f"writing_pending_{task_id}"
+            writing_started_key = f"{writing_pending_key}_started_at"
+            writing_result_key = f"writing_result_{task_id}"
+            writing_result_hash_key = f"writing_result_hash_{task_id}"
+            writing_error_key = f"writing_error_{task_id}"
+            writing_submitted_essay_key = f"writing_submitted_essay_{task_id}"
+            writing_submitted_hash_key = f"writing_submitted_hash_{task_id}"
 
-                            supabase.table("writing_history").insert({
-                                "username": current_user,
-                                "task_id": task_id,
-                                "user_essay": user_essay.strip(),
-                                "evaluation": evaluation,
-                            }).execute()
-                            load_writing_history.clear()
-                            st.balloons()
-                        except Exception as e:
-                            engine = "Gemini" if is_task1 else "DeepSeek"
-                            st.error(f"{engine} 批改失败：{e}")
+            if st.session_state.get(writing_pending_key):
+                submitted_essay = st.session_state.get(
+                    writing_submitted_essay_key,
+                    user_essay.strip(),
+                )
+                submitted_hash = st.session_state.get(
+                    writing_submitted_hash_key,
+                    writing_fingerprint(task_id, submitted_essay),
+                )
+                status_box = st.status(
+                    "正在批改本次作文，请勿刷新页面",
+                    expanded=True,
+                )
+                started_at = st.session_state.get(writing_started_key, "刚刚")
+                status_box.write(f"1/4 已收到提交。开始时间：{started_at}")
+                status_box.write("2/4 正在发送题目和作文给 AI。")
+                try:
+                    evaluation = route_writing_evaluation(
+                        writing_task_type,
+                        selected_task["title"],
+                        task_instructions,
+                        selected_task.get("question_image"),
+                        submitted_essay,
+                    )
+                    status_box.write("3/4 AI 批改完成，正在保存历史记录。")
+                    supabase.table("writing_history").insert({
+                        "username": current_user,
+                        "task_id": task_id,
+                        "user_essay": submitted_essay,
+                        "evaluation": evaluation,
+                    }).execute()
+                    load_writing_history.clear()
+
+                    st.session_state[writing_result_key] = evaluation
+                    st.session_state[writing_result_hash_key] = submitted_hash
+                    st.session_state[writing_error_key] = ""
+                    st.session_state[writing_pending_key] = False
+                    st.session_state.pop(writing_started_key, None)
+                    status_box.write("4/4 批改结果已归档。")
+                    status_box.update(label="本次作文批改完成", state="complete")
+                    st.success("🎉 批改完成！")
+                    render_writing_evaluation_result(
+                        evaluation,
+                        unsafe_allow_html=unsafe_writing_markdown,
+                    )
+                    st.balloons()
+                except Exception as e:
+                    engine = "Gemini" if is_task1 else "DeepSeek"
+                    st.session_state[writing_error_key] = f"{engine} 批改失败：{e}"
+                    st.session_state[writing_pending_key] = False
+                    st.session_state.pop(writing_started_key, None)
+                    status_box.update(label="本次批改未完成", state="error")
+                    st.error(st.session_state[writing_error_key])
+                    st.caption("作文草稿已保留，可以直接重新提交。")
+                    if st.button("重新提交本次作文", key=f"retry_writing_{task_id}"):
+                        st.session_state[writing_pending_key] = True
+                        st.session_state[writing_started_key] = time.strftime("%H:%M:%S")
+                        st.rerun()
+            else:
+                previous_error = st.session_state.get(writing_error_key, "")
+                if previous_error:
+                    st.error(previous_error)
+                    st.caption("作文草稿已保留，修改后可以重新提交。")
+
+                stored_result = st.session_state.get(writing_result_key, "")
+                stored_hash = st.session_state.get(writing_result_hash_key, "")
+                if stored_result:
+                    if stored_hash == current_essay_hash:
+                        st.info("当前这版作文已经完成批改。修改草稿后可以再次提交。")
+                    else:
+                        st.warning("草稿已经修改。下方仍是上一次提交版本的批改结果。")
+                    render_writing_evaluation_result(
+                        stored_result,
+                        unsafe_allow_html=unsafe_writing_markdown,
+                    )
+
+                submit_disabled = (
+                    not user_essay.strip()
+                    or bool(stored_result and stored_hash == current_essay_hash)
+                )
+                if st.button(
+                    "📤 提交批改",
+                    type="primary",
+                    key=f"btn_submit_writing_{task_id}",
+                    disabled=submit_disabled,
+                ):
+                    st.session_state[writing_submitted_essay_key] = user_essay.strip()
+                    st.session_state[writing_submitted_hash_key] = current_essay_hash
+                    st.session_state[writing_pending_key] = True
+                    st.session_state[writing_started_key] = time.strftime("%H:%M:%S")
+                    st.session_state[writing_error_key] = ""
+                    st.rerun()
 
 

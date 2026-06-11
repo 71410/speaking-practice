@@ -1,1 +1,9 @@
 .streamlit/secrets.toml
+
+# Android wrapper build artifacts
+android-shell/node_modules/
+android-shell/dist/
+android-shell/.gradle/
+android-shell/android/.gradle/
+android-shell/android/app/build/
+android-shell/android/build/
