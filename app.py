@@ -3,16 +3,17 @@ from audio_recorder_streamlit import audio_recorder
 from google import genai
 from google.genai import types as genai_types
 from supabase import create_client, Client
-import pandas as pd
+import csv
 import json
-import re  
+import re
+from datetime import datetime, timedelta, timezone
 from gtts import gTTS
 import base64
 import hashlib
 import io
 import time
 from openai import OpenAI
-import PyPDF2
+import pypdf
 
 # --- 1. 🔑 核心配置区 (中西合璧：DeepSeek + Gemini) ---
 GEMINI_API_KEY_VOICE = st.secrets["GEMINI_API_KEY_VOICE"]
@@ -45,15 +46,108 @@ GEMINI_FLASH_MODEL = "gemini-2.5-flash"
 NAV_PAGES = [
     "🏠 训练台",
     "🗣️ 模拟考官",
+    "🎤 我的素材朗读",
     "📖 英文原版朗读纠音",
     "✍️ 雅思写作练习",
     "👤 个人档案",
 ]
 
+# release_inactive_audio 靠这些前缀识别「手动存进 session_state 的录音」。
+# 新增录音模块时必须把前缀登记到这里，否则录音不会被回收。
+AUDIO_STATE_PREFIXES = ("audio_qa_", "audio_reading_", "audio_material_")
+
+# gTTS 用 tld 切换口音。
+TTS_ACCENTS = {
+    "🇬🇧 英式": "co.uk",
+    "🇺🇸 美式": "com",
+    "🇦🇺 澳式": "com.au",
+}
+
+
+SUPABASE_PAGE_SIZE = 1000
+
 
 def request_page_change(page_name: str) -> None:
     st.session_state.requested_page = page_name
     st.rerun()
+
+
+def fetch_all_rows(table: str, columns: str, order_column: str = "id") -> list:
+    """分页拉取整张表。
+
+    Supabase 项目默认 max-rows = 1000，直接 select() 超过上限会静默截断且不报错。
+    这里按 range 逐页取，直到某一页不满为止。
+    """
+    rows: list = []
+    start = 0
+    while True:
+        response = (
+            supabase.table(table)
+            .select(columns)
+            .order(order_column)
+            .range(start, start + SUPABASE_PAGE_SIZE - 1)
+            .execute()
+        )
+        batch = response.data or []
+        rows.extend(batch)
+        if len(batch) < SUPABASE_PAGE_SIZE:
+            return rows
+        start += SUPABASE_PAGE_SIZE
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def count_rows(table: str, column: str | None = None, value=None) -> int:
+    """只取行数，不拉正文。用于首页训练台的统计展示。"""
+    query = supabase.table(table).select("id", count="exact").limit(1)
+    if column is not None:
+        query = query.eq(column, value)
+    response = query.execute()
+    return response.count or 0
+
+
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def format_record_time(raw) -> str:
+    """把 Supabase 的 UTC 时间戳转成北京时间展示。"""
+    if not raw:
+        return ""
+    try:
+        moment = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return str(raw)[:16]
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+
+
+def render_history_records(records: list, text_field: str) -> None:
+    """统一渲染历史记录，最新一次在最前面。"""
+    for index, record in enumerate(records):
+        label = "最近一次" if index == 0 else f"往前第 {index} 次"
+        st.markdown(f"**▶ {label}**　{format_record_time(record.get('created_at'))}")
+        st.write(record[text_field])
+        st.write("---")
+
+
+def release_inactive_audio(active_audio_key: str) -> None:
+    """只保留当前题目的录音。
+
+    录音是手动写进 session_state 的（不是 widget state，Streamlit 不会自动回收），
+    连续换题练习会让多段未压缩 WAV 常驻内存，最终撑爆 Streamlit Cloud 的内存配额。
+    """
+    for key in list(st.session_state.keys()):
+        if not isinstance(key, str):
+            continue
+        if key.startswith(AUDIO_STATE_PREFIXES) and key != active_audio_key:
+            st.session_state.pop(key, None)
+            st.session_state.pop("audio_hash_" + key[len("audio_"):], None)
+
+
+def split_sentences(text: str) -> list[str]:
+    """按句末标点切句，用于逐句精读。切不出来时退回整段。"""
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return sentences or [text.strip()]
 
 
 def is_transient_gemini_error(error: Exception) -> bool:
@@ -131,6 +225,114 @@ def submit_audio_for_scoring(pending_key: str) -> None:
     st.session_state[pending_key] = True
     st.session_state[f"{pending_key}_started_at"] = time.strftime("%H:%M:%S")
     st.rerun()
+
+
+def render_recording_practice(
+    *,
+    scope_id: str,
+    audio_prefix: str,
+    build_prompt,
+    save_history,
+    recorder_text: str = "点击麦克风开始录音",
+    submit_label: str = "📤 提交本次录音评分",
+    reset_label: str = "🔄 清除录音，再录一次",
+    success_message: str = "🎉 评分完成！",
+    celebrate: bool = False,
+) -> None:
+    """录音 → 提交 → Gemini 评分 → 存档 的完整流程。
+
+    scope_id 决定这一组 session_state 的命名空间（换素材/换句子就换一组）。
+    评分结果会写进 session_state，这样后续 rerun 时报告不会消失。
+    """
+    counter_key = f"counter_{audio_prefix}_{scope_id}"
+    if counter_key not in st.session_state:
+        st.session_state[counter_key] = 0
+    gen = st.session_state[counter_key]
+
+    audio_bytes = audio_recorder(
+        text=recorder_text,
+        icon_size="2x",
+        pause_threshold=60.0,
+        key=f"recorder_{audio_prefix}_{scope_id}_{gen}",
+    )
+
+    audio_key = f"audio_{audio_prefix}_{scope_id}"
+    hash_key = f"audio_hash_{audio_prefix}_{scope_id}"
+    release_inactive_audio(audio_key)
+    if audio_bytes:
+        st.session_state[audio_key] = audio_bytes
+        st.session_state[hash_key] = audio_fingerprint(audio_bytes)
+
+    saved_audio = st.session_state.get(audio_key)
+    saved_hash = st.session_state.get(hash_key, "")
+    if not saved_audio:
+        return
+
+    st.audio(saved_audio, format="audio/wav")
+    show_audio_payload_info(saved_audio)
+
+    tracker_key = f"last_audio_{audio_prefix}_{scope_id}"
+    pending_key = f"pending_{audio_prefix}_{scope_id}"
+    started_key = f"{pending_key}_started_at"
+    report_key = f"report_{audio_prefix}_{scope_id}"
+    already_scored = st.session_state.get(tracker_key) == saved_hash
+
+    if already_scored:
+        stored_report = st.session_state.get(report_key, "")
+        if stored_report:
+            st.markdown(stored_report)
+        else:
+            st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
+    elif st.session_state.get(pending_key):
+        st.success("录音已提交。")
+        status_box = st.status("正在处理本次录音评分，请勿刷新页面", expanded=True)
+        status_box.write(f"1/4 已收到提交。开始时间：{st.session_state.get(started_key, '刚刚')}")
+        status_box.write("2/4 正在发送录音给 Gemini。")
+        try:
+            response = generate_gemini_content_with_retry(
+                contents=[wav_audio_part(saved_audio), build_prompt()]
+            )
+            status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+            st.success(success_message)
+            st.markdown(response.text)
+
+            status_box.write("4/4 正在保存历史记录。")
+            # 存档失败不应该让用户丢掉已经拿到的评分，所以单独捕获。
+            try:
+                save_history(response.text)
+            except Exception as save_error:
+                status_box.write("历史记录保存失败，但本次评分结果仍然有效。")
+                st.warning(f"评分已生成，但历史记录没能存进数据库：{save_error}")
+
+            st.session_state[report_key] = response.text
+            st.session_state[tracker_key] = saved_hash
+            st.session_state[pending_key] = False
+            st.session_state.pop(started_key, None)
+            status_box.update(label="本次评分完成", state="complete")
+            if celebrate:
+                st.balloons()
+        except Exception as e:
+            st.session_state[pending_key] = False
+            st.session_state.pop(started_key, None)
+            status_box.update(label="本次评分未完成", state="error")
+            show_gemini_busy_error(e)
+            if st.button("重新提交本次录音评分", key=f"retry_{audio_prefix}_{scope_id}_{gen}"):
+                submit_audio_for_scoring(pending_key)
+    else:
+        st.success("录音已保存。确认无误后点击下方按钮提交评分。")
+        if st.button(
+            submit_label,
+            type="primary",
+            key=f"submit_{audio_prefix}_{scope_id}_{gen}",
+        ):
+            submit_audio_for_scoring(pending_key)
+
+    st.markdown("---")
+    if st.button(reset_label, key=f"reset_{audio_prefix}_{scope_id}_{gen}"):
+        for key in (audio_key, hash_key, tracker_key, pending_key, started_key, report_key):
+            st.session_state.pop(key, None)
+        st.session_state[counter_key] += 1
+        st.rerun()
 
 
 def render_personalized_answer(question: str, username: str, answer_key: str, button_key: str) -> None:
@@ -244,53 +446,68 @@ def split_markdown_sections(markdown_text: str) -> list[tuple[str, str]]:
     return [(title, "\n".join(lines).strip()) for title, lines in sections if "\n".join(lines).strip()]
 
 
-def render_writing_evaluation_result(evaluation: str, unsafe_allow_html: bool) -> None:
+def render_writing_evaluation_result(evaluation: str) -> None:
+    """渲染批改结果。
+
+    这里刻意不开 unsafe_allow_html：内容是模型直接产出的，没有必要当 HTML 执行；
+    批改报告里唯一需要的富格式是 markdown 表格，st.markdown 原生就支持。
+    """
     st.subheader("✅ 批改结果")
     sections = split_markdown_sections(evaluation)
 
     if len(sections) <= 1:
-        st.markdown(evaluation, unsafe_allow_html=unsafe_allow_html)
+        st.markdown(evaluation)
         return
 
     for index, (title, body) in enumerate(sections):
         expanded = index == 0 or "总评" in title or "总分" in title or "Overall" in title
         with st.expander(title, expanded=expanded):
-            st.markdown(body, unsafe_allow_html=unsafe_allow_html)
+            st.markdown(body)
 
 
 def render_training_dashboard(current_user: str) -> None:
     st.subheader("今天想练什么？")
     st.caption("从一个模块开始就好。训练过程中录音、作文和批改结果都会尽量保留在当前会话里。")
 
-    question_bank = load_question_bank()
-    reading_bank = load_reading_bank()
-    task1_count = len(load_writing_tasks("Task 1"))
-    task2_count = len(load_writing_tasks("Task 2"))
+    # 首页只展示统计数字，用 count 查询即可，不必把整个题库和朗读原文拉下来。
+    question_count = count_rows("question_bank")
+    reading_count = count_rows("reading_bank")
+    task1_count = count_rows("writing_bank", "task_type", "Task 1")
+    task2_count = count_rows("writing_bank", "task_type", "Task 2")
     profile_filled = bool(load_profile_information(current_user).strip())
+    # 素材库依赖新表，没建好之前不能让首页整块崩掉。
+    material_count = (
+        count_rows("speaking_materials", "username", current_user)
+        if speaking_tables_ready()
+        else None
+    )
 
-    col_speaking, col_reading, col_writing = st.columns(3)
+    col_speaking, col_material, col_reading, col_writing = st.columns(4)
 
     with col_speaking:
-        question_count = sum(
-            len(questions)
-            for themes in question_bank.values()
-            for questions in themes.values()
-        )
         st.markdown("#### 🗣️ 模拟考官")
         st.caption(f"题库：{question_count} 道题")
-        if st.button("开始口语训练", type="primary", use_container_width=True):
+        if st.button("开始口语训练", type="primary", width="stretch"):
             request_page_change("🗣️ 模拟考官")
+
+    with col_material:
+        st.markdown("#### 🎤 我的素材")
+        st.caption(
+            f"我的素材：{material_count} 条" if material_count is not None else "素材库待初始化"
+        )
+        if st.button("练自己的素材", type="primary", width="stretch"):
+            request_page_change("🎤 我的素材朗读")
 
     with col_reading:
         st.markdown("#### 📖 朗读纠音")
-        st.caption(f"材料：{len(reading_bank)} 篇")
-        if st.button("开始朗读训练", type="primary", use_container_width=True):
+        st.caption(f"材料：{reading_count} 篇")
+        if st.button("开始朗读训练", type="primary", width="stretch"):
             request_page_change("📖 英文原版朗读纠音")
 
     with col_writing:
         st.markdown("#### ✍️ 写作批改")
         st.caption(f"Task 1：{task1_count} 题｜Task 2：{task2_count} 题")
-        if st.button("开始写作练习", type="primary", use_container_width=True):
+        if st.button("开始写作练习", type="primary", width="stretch"):
             request_page_change("✍️ 雅思写作练习")
 
     st.markdown("---")
@@ -300,17 +517,34 @@ def render_training_dashboard(current_user: str) -> None:
         request_page_change("👤 个人档案")
 
 
-def file_to_base64(uploaded_file) -> str:
-    return base64.b64encode(uploaded_file.getvalue()).decode("utf-8")
-
-
 @st.cache_data(ttl=86400, show_spinner=False)
-def synthesize_tts_b64(text: str, tld: str = "co.uk") -> str:
+def synthesize_tts_audio(text: str, tld: str = "co.uk", slow: bool = False) -> bytes:
     sound_file = io.BytesIO()
-    tts = gTTS(text=text, lang="en", tld=tld)
+    tts = gTTS(text=text, lang="en", tld=tld, slow=slow)
     tts.write_to_fp(sound_file)
-    sound_file.seek(0)
-    return base64.b64encode(sound_file.read()).decode()
+    return sound_file.getvalue()
+
+
+def render_tts_demo(target_text: str, key_prefix: str) -> None:
+    """示范朗读：可选口音与语速。音频按 (文本, 口音, 语速) 缓存 24 小时。"""
+    col_accent, col_speed = st.columns([2, 1])
+    with col_accent:
+        accent_label = st.selectbox(
+            "🔊 示范口音：",
+            list(TTS_ACCENTS.keys()),
+            key=f"{key_prefix}_accent",
+        )
+    with col_speed:
+        slow = st.checkbox("🐢 慢速", key=f"{key_prefix}_slow")
+
+    if st.button("🎧 听示范朗读", key=f"{key_prefix}_play"):
+        with st.spinner("正在生成示范朗读..."):
+            try:
+                audio = synthesize_tts_audio(target_text, TTS_ACCENTS[accent_label], slow)
+            except Exception as e:
+                st.error(f"示范朗读生成失败（gTTS 需要联网）：{e}")
+                return
+        st.audio(audio, format="audio/mp3", autoplay=True)
 
 
 def base64_to_image_bytes(b64_str: str) -> bytes | None:
@@ -421,11 +655,13 @@ def get_admin_writing_content() -> str:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_writing_tasks(task_type: str) -> list:
+    """只取题目列表用的轻字段，question_image 留给 load_writing_task_detail 按需拉。"""
     response = (
         supabase.table("writing_bank")
         .select("id, task_type, title, content")
         .eq("task_type", task_type)
         .order("id")
+        .range(0, SUPABASE_PAGE_SIZE - 1)
         .execute()
     )
     return response.data or []
@@ -448,18 +684,237 @@ def load_writing_task_detail(task_id: int) -> dict:
 def clear_writing_task_caches() -> None:
     load_writing_tasks.clear()
     load_writing_task_detail.clear()
+    count_rows.clear()
+
+
+def clear_question_bank_caches() -> None:
+    load_question_bank.clear()
+    count_rows.clear()
+
+
+def clear_reading_bank_caches() -> None:
+    load_reading_bank.clear()
+    count_rows.clear()
+
+
+# ---------- 个人素材库（每个用户自己的朗读素材） ----------
+
+SPEAKING_MATERIALS_SQL = """create table if not exists speaking_materials (
+  id          bigint generated always as identity primary key,
+  username    text        not null,
+  title       text        not null,
+  content     text        not null,
+  created_at  timestamptz not null default now()
+);
+create index if not exists speaking_materials_user_idx
+  on speaking_materials (username, id desc);
+
+create table if not exists material_history (
+  id              bigint generated always as identity primary key,
+  username        text        not null,
+  material_title  text        not null,
+  record_text     text        not null,
+  created_at      timestamptz not null default now()
+);
+create index if not exists material_history_lookup_idx
+  on material_history (username, material_title, created_at desc);"""
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def speaking_tables_ready() -> bool:
+    """素材库依赖两张新表；没建好时页面要给出可执行的建表 SQL 而不是直接崩。"""
+    try:
+        supabase.table("speaking_materials").select("id").limit(1).execute()
+        supabase.table("material_history").select("id").limit(1).execute()
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_speaking_materials(username: str) -> list:
+    """加载某用户的全部素材，最新添加的排在前面。"""
+    response = (
+        supabase.table("speaking_materials")
+        .select("id, title, content, created_at")
+        .eq("username", username)
+        .order("id", desc=True)
+        .range(0, SUPABASE_PAGE_SIZE - 1)
+        .execute()
+    )
+    return response.data or []
+
+
+def save_speaking_material(username: str, title: str, content: str) -> None:
+    supabase.table("speaking_materials").insert(
+        {"username": username, "title": title, "content": content}
+    ).execute()
+    load_speaking_materials.clear()
+    count_rows.clear()
+
+
+def delete_speaking_material(username: str, material_id: int) -> None:
+    # 带上 username 条件，避免误删到别人的素材。
+    supabase.table("speaking_materials").delete().eq("id", material_id).eq(
+        "username", username
+    ).execute()
+    load_speaking_materials.clear()
+    count_rows.clear()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_material_history(username: str, material_title: str) -> list:
+    response = (
+        supabase.table("material_history")
+        .select("record_text, created_at")
+        .eq("username", username)
+        .eq("material_title", material_title)
+        .order("created_at", desc=True)
+        .limit(5)
+        .execute()
+    )
+    return response.data or []
+
+
+def save_material_history(username: str, material_title: str, record_text: str) -> None:
+    supabase.table("material_history").insert(
+        {
+            "username": username,
+            "material_title": material_title,
+            "record_text": record_text,
+        }
+    ).execute()
+    load_material_history.clear()
+
+
+DEEPSEEK_EXTRACT_SYSTEM_PROMPT = (
+    "You are a precise JSON data extraction tool. "
+    "Output strictly valid JSON arrays without markdown syntax."
+)
+
+# 数据库列 -> (来源字段名, 缺失时的兜底值)，CSV 与 PDF 两条导入路径共用。
+QUESTION_BANK_FIELDS = {
+    "part": ("part", "未分类"),
+    "theme": ("theme", "未分类"),
+    "question_text": ("question", "提取失败"),
+}
+READING_BANK_FIELDS = {
+    "title": ("title", "未命名文章"),
+    "content": ("content", "内容提取失败"),
+}
+
+
+def strip_json_code_fence(raw_text: str) -> str:
+    raw = raw_text.strip()
+    if raw.startswith("```json"):
+        raw = raw[7:]
+    if raw.startswith("```"):
+        raw = raw[3:]
+    if raw.endswith("```"):
+        raw = raw[:-3]
+    return raw.strip()
+
+
+def read_pdf_text(uploaded_file, limit: int = 30000) -> str:
+    reader = pypdf.PdfReader(uploaded_file)
+    pages = [(page.extract_text() or "") for page in reader.pages]
+    text = "\n".join(pages).strip()
+    if not text:
+        raise ValueError("这个 PDF 没有可提取的文字层（可能是扫描件）。")
+    return text[:limit]
+
+
+def map_records(records: list, field_map: dict) -> list:
+    return [
+        {
+            column: str(record.get(source_key) or fallback).strip()
+            for column, (source_key, fallback) in field_map.items()
+        }
+        for record in records
+    ]
+
+
+def read_csv_records(uploaded_file, field_map: dict) -> list:
+    text = uploaded_file.getvalue().decode("utf-8-sig")
+    reader = csv.DictReader(io.StringIO(text))
+    columns = reader.fieldnames or []
+    missing = [source_key for source_key, _ in field_map.values() if source_key not in columns]
+    if missing:
+        raise ValueError(
+            f"CSV 缺少必需的列：{'、'.join(missing)}；文件里实际的列是：{'、'.join(columns) or '（空）'}"
+        )
+    return map_records(list(reader), field_map)
+
+
+def extract_records_with_deepseek(pdf_text: str, instruction: str, field_map: dict) -> list:
+    prompt = f"""{instruction}
+绝对不要输出任何 markdown 标记、不要废话，只输出纯文本 JSON 数组。
+
+【源文本】:
+{pdf_text}
+"""
+    response = client_admin.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": DEEPSEEK_EXTRACT_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.1,
+        max_tokens=8192,
+    )
+    extracted = json.loads(strip_json_code_fence(response.choices[0].message.content))
+    if not isinstance(extracted, list):
+        raise ValueError("AI 没有返回 JSON 数组。")
+    return map_records(extracted, field_map)
+
+
+def import_bank_file(
+    uploaded_file,
+    table: str,
+    field_map: dict,
+    pdf_instruction: str,
+    label: str,
+    clear_cache,
+) -> None:
+    """CSV / PDF 两种来源统一走这条导入通道（口语题库与阅读文章库共用）。"""
+    filename = uploaded_file.name.lower()
+    try:
+        if filename.endswith(".csv"):
+            with st.spinner(f"正在解析 {label} CSV..."):
+                rows = read_csv_records(uploaded_file, field_map)
+        elif filename.endswith(".pdf"):
+            with st.spinner("🤖 正在召唤 DeepSeek 大脑提取内容..."):
+                rows = extract_records_with_deepseek(
+                    read_pdf_text(uploaded_file), pdf_instruction, field_map
+                )
+        else:
+            st.sidebar.error("只支持 CSV 或 PDF 文件。")
+            return
+    except Exception as e:
+        st.sidebar.error(f"解析失败：{e}")
+        return
+
+    if not rows:
+        st.sidebar.warning("没有解析出任何内容，请检查文件格式。")
+        return
+
+    try:
+        with st.spinner("正在写入数据库..."):
+            supabase.table(table).insert(rows).execute()
+    except Exception as e:
+        st.sidebar.error(f"写入数据库失败：{e}")
+        return
+
+    clear_cache()
+    st.sidebar.success(f"✅ 成功导入 {len(rows)} 条{label}！")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def load_question_bank() -> dict:
     """加载完整口语题库，缓存 5 分钟。管理员上传新题后自动刷新。"""
-    response = (
-        supabase.table("question_bank")
-        .select("part, theme, question_text")
-        .execute()
-    )
+    rows = fetch_all_rows("question_bank", "part, theme, question_text")
     bank: dict = {}
-    for row in (response.data or []):
+    for row in rows:
         p = row.get("part", "未分类")
         t = row.get("theme", "未分类")
         q = row.get("question_text", "提取失败")
@@ -474,18 +929,19 @@ def load_question_bank() -> dict:
 @st.cache_data(ttl=300, show_spinner=False)
 def load_reading_bank() -> dict:
     """加载完整阅读材料库，缓存 5 分钟。"""
-    response = supabase.table("reading_bank").select("title, content").execute()
-    return {row["title"]: row["content"] for row in (response.data or [])}
+    rows = fetch_all_rows("reading_bank", "title, content")
+    return {row["title"]: row["content"] for row in rows}
 
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_practice_history(username: str, question: str) -> list:
-    """加载某用户某道题的练习历史，缓存 30 秒。"""
+    """加载某用户某道题最近 5 次练习记录，最新的排在前面，缓存 30 秒。"""
     response = (
         supabase.table("practice_history")
-        .select("record_text")
+        .select("record_text, created_at")
         .eq("username", username)
         .eq("question", question)
+        .order("created_at", desc=True)
         .limit(5)
         .execute()
     )
@@ -494,12 +950,13 @@ def load_practice_history(username: str, question: str) -> list:
 
 @st.cache_data(ttl=30, show_spinner=False)
 def load_reading_history(username: str, reading_title: str) -> list:
-    """加载某用户某材料的朗读历史，缓存 30 秒。"""
+    """加载某用户某材料最近 5 次朗读记录，最新的排在前面，缓存 30 秒。"""
     response = (
         supabase.table("reading_history")
-        .select("record_text")
+        .select("record_text, created_at")
         .eq("username", username)
         .eq("reading_title", reading_title)
+        .order("created_at", desc=True)
         .limit(5)
         .execute()
     )
@@ -519,6 +976,56 @@ def load_writing_history(username: str, task_id: int) -> list:
         .execute()
     )
     return response.data or []
+
+
+def build_material_scoring_prompt(target_text: str) -> str:
+    return f"""你是一名雅思口语考官，本次只评估 Pronunciation（发音）这一单项。考生正在朗读下面这段指定文本，我已上传他的录音。
+
+【指定文本】
+{target_text}
+
+请先把录音逐字与指定文本比对，再按雅思 Pronunciation 标准打分。所有分数用 0-9 分，允许 0.5 分档。
+
+严格按以下结构输出：
+
+## 🎯 综合发音得分
+**X.X / 9**
+一句话说明这个分数对应雅思 Pronunciation 单项的什么水平。
+
+## 1️⃣ 发音准确度
+**分数：X.X**
+用表格逐个列出读错的词（至少列出所有明显错误，没有就写「无」）：
+
+| 原文单词 | 你读成 | 正确音标 | 怎么改 |
+|---|---|---|---|
+
+再补充：
+- 漏读 / 多读 / 替换掉的词
+- 有没有系统性的音素问题（例如 /θ/ 读成 /s/、词尾辅音吞掉、长短元音不分、/l/ 与 /n/ 混淆），有就单独点名
+
+## 2️⃣ 流利度与节奏
+**分数：X.X**
+- 估算语速（约 X 词/分钟），并说明相对朗读语速是偏快还是偏慢
+- 停顿是否落在意群边界上；列出停错位置的具体词
+- 指出卡顿、重复、自我纠正分别出现在哪几个词附近
+
+## 3️⃣ 重音与语调
+**分数：X.X**
+- 单词重音（Word Stress）错误：列出单词并用大写标出正确重音位置，例如 `PHOtograph` → `phoTOgrapher`
+- 句子重音（Sentence Stress）：该被强调的实词有没有被弱读掉
+- 语调（升调/降调）用得是否恰当
+- 连读（Linking）和弱读（Weak Form）有没有做出来；举出原文中本该连读却断开的位置
+
+## 🔁 针对性练习
+给 3 条马上能做的练习，每条必须对应上面指出的一个具体问题，不要泛泛而谈。
+
+## 📌 下次朗读只改这一点
+一句话，只说最该改的那一个点。
+
+要求：
+- 不要纠结英式还是美式口音，只要前后一致且清晰即可。
+- 所有评价必须引用录音里的具体单词作为证据，严禁空泛表扬。
+- 如果录音听不清或几乎没有人声，直接说明情况并给出重录建议，不要编造评分。"""
 
 
 def evaluate_writing_task1_gemini(
@@ -796,15 +1303,17 @@ if "logged_in" not in st.session_state:
 
 if not st.session_state.logged_in:
     st.title(" 高分英语训练舱 - 内部邀请版")
-    username = st.text_input("👤 账号")
-    password = st.text_input("🔑 密码", type="password")
-    
-    if st.button("登录"):
+    # 用 form 包起来，密码框里按回车即可提交（不必去点按钮）。
+    with st.form("login_form"):
+        username = st.text_input("👤 账号")
+        password = st.text_input("🔑 密码", type="password")
+        submitted = st.form_submit_button("登录", type="primary")
+
+    if submitted:
         if username in USER_DATABASE and USER_DATABASE[username] == password:
             st.session_state.logged_in = True
             st.session_state.current_user = username
             st.session_state.current_page = "🏠 训练台"
-            st.success(f"登录成功！欢迎回来，{username}！")
             st.rerun()
         else:
             st.error("❌ 账号或密码错误！")
@@ -829,135 +1338,40 @@ else:
         
         if upload_target == "🗣️ 口语题库":
             uploaded_file = st.sidebar.file_uploader("📂 智能导入口语题 (CSV / PDF)", type=["csv", "pdf"])
-            if uploaded_file is not None:
-                if st.sidebar.button("🚀 启动智能分析与导入"):
-                    if uploaded_file.name.endswith('.csv'):
-                        with st.spinner("正在写入口语表格..."):
-                            df = pd.read_csv(uploaded_file)
-                            rows = [
-                                {
-                                    "part": str(row["part"]),
-                                    "theme": str(row["theme"]),
-                                    "question_text": str(row["question"]),
-                                }
-                                for _, row in df.iterrows()
-                            ]
-                            if rows:
-                                supabase.table("question_bank").insert(rows).execute()
-                        st.sidebar.success("✅ 口语 CSV 导入成功！")
-                        load_question_bank.clear()
-                    
-                    elif uploaded_file.name.endswith('.pdf'):
-                        with st.spinner("🤖 正在召唤 DeepSeek 大脑提取题目..."):
-                            try:
-                                reader = PyPDF2.PdfReader(uploaded_file)
-                                pdf_text = ""
-                                for page in reader.pages:
-                                    pdf_text += page.extract_text() + "\n"
-                                
-                                prompt = f"""
-                                提取以下文本中的所有雅思口语题目。
-                                请严格将结果以 JSON 数组的形式返回。每一个元素包含三个键：
-                                "part"（如 "Part 1", "Part 2"）、"theme"（主题）、"question"（具体英文题目）。
-                                绝对不要输出任何 markdown 标记、不要废话，只输出纯文本 JSON 数组。
-                                \n\n【源文本】:\n{pdf_text[:30000]}
-                                """
-                                response = client_admin.chat.completions.create(
-                                    model="deepseek-chat",
-                                    messages=[
-                                        {"role": "system", "content": "You are a precise JSON data extraction tool. Output strictly valid JSON arrays without markdown syntax."},
-                                        {"role": "user", "content": prompt}
-                                    ],
-                                    temperature=0.1,
-                                    max_tokens=8192  # 👈 新增这行！给它最大的肺活量！
-                                )
-                                
-                                raw_text = response.choices[0].message.content.strip()
-                                if raw_text.startswith("```json"): raw_text = raw_text[7:]
-                                if raw_text.startswith("```"): raw_text = raw_text[3:]
-                                if raw_text.endswith("```"): raw_text = raw_text[:-3]
-                                
-                                extracted_data = json.loads(raw_text.strip())
-                                rows = [
-                                    {
-                                        "part": str(item.get("part", "未分类")),
-                                        "theme": str(item.get("theme", "未分类")),
-                                        "question_text": str(item.get("question", "提取失败")),
-                                    }
-                                    for item in extracted_data
-                                ]
-                                if rows:
-                                    supabase.table("question_bank").insert(rows).execute()
-                                st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 道口语题！")
-                                load_question_bank.clear()
-                            except Exception as e:
-                                st.sidebar.error(f"DeepSeek 解析短路：{e}")
+            st.sidebar.caption("CSV 需要包含 part / theme / question 三列。")
+            if uploaded_file is not None and st.sidebar.button("🚀 启动智能分析与导入"):
+                import_bank_file(
+                    uploaded_file,
+                    table="question_bank",
+                    field_map=QUESTION_BANK_FIELDS,
+                    pdf_instruction=(
+                        "提取以下文本中的所有雅思口语题目。\n"
+                        "请严格将结果以 JSON 数组的形式返回。每一个元素包含三个键："
+                        '"part"（如 "Part 1", "Part 2"）、"theme"（主题）、"question"（具体英文题目）。'
+                    ),
+                    label="口语题",
+                    clear_cache=clear_question_bank_caches,
+                )
 
         elif upload_target == "📖 阅读文章库":
             input_method = st.sidebar.radio("📥 录入方式：", ["📁 文件上传", "✍️ 手动粘贴文本"])
             if input_method == "📁 文件上传":
                 uploaded_file = st.sidebar.file_uploader("📂 导入阅读文章 (CSV / PDF)", type=["csv", "pdf"])
-                if uploaded_file is not None:
-                    if st.sidebar.button("🚀 启动智能分析与导入"):
-                        if uploaded_file.name.endswith('.csv'):
-                            with st.spinner("正在写入阅读表格..."):
-                                df = pd.read_csv(uploaded_file)
-                                rows = [
-                                    {
-                                        "title": str(row["title"]),
-                                        "content": str(row["content"]),
-                                    }
-                                    for _, row in df.iterrows()
-                                ]
-                                if rows:
-                                    supabase.table("reading_bank").insert(rows).execute()
-                            st.sidebar.success("✅ 阅读 CSV 导入成功！")
-                            load_reading_bank.clear()
-                        elif uploaded_file.name.endswith('.pdf'):
-                            with st.spinner("🤖 正在召唤 DeepSeek 大脑拆解文章..."):
-                                try:
-                                    reader = PyPDF2.PdfReader(uploaded_file)
-                                    pdf_text = ""
-                                    for page in reader.pages:
-                                        pdf_text += page.extract_text() + "\n"
-                                    
-                                    prompt = f"""
-                                    提取以下文本中适合英语朗读的段落或文章。
-                                    请严格以 JSON 数组返回。每个元素包含两个键：
-                                    "title"（文章或段落的标题/概括）、"content"（具体的英文原文正文）。
-                                    绝对不要输出任何 markdown 标记、不要废话，只输出纯文本 JSON 数组。
-                                    \n\n【源文本】:\n{pdf_text[:30000]}
-                                    """
-                                    response = client_admin.chat.completions.create(
-                                        model="deepseek-chat",
-                                        messages=[
-                                            {"role": "system", "content": "You are a precise JSON data extraction tool. Output strictly valid JSON arrays without markdown syntax."},
-                                            {"role": "user", "content": prompt}
-                                        ],
-                                        temperature=0.1,
-                                        max_tokens=8192  # 👈 新增这行！给它最大的肺活量！
-                                    )
-                                    
-                                    raw_text = response.choices[0].message.content.strip()
-                                    if raw_text.startswith("```json"): raw_text = raw_text[7:]
-                                    if raw_text.startswith("```"): raw_text = raw_text[3:]
-                                    if raw_text.endswith("```"): raw_text = raw_text[:-3]
-                                    
-                                    extracted_data = json.loads(raw_text.strip())
-                                    rows = [
-                                        {
-                                            "title": str(item.get("title", "未命名文章")),
-                                            "content": str(item.get("content", "内容提取失败")),
-                                        }
-                                        for item in extracted_data
-                                    ]
-                                    if rows:
-                                        supabase.table("reading_bank").insert(rows).execute()
-                                    st.sidebar.success(f"✅ DeepSeek 成功导入 {len(extracted_data)} 篇阅读文章！")
-                                    load_reading_bank.clear()
-                                except Exception as e:
-                                    st.sidebar.error(f"DeepSeek 解析短路：{e}")
-                                    
+                st.sidebar.caption("CSV 需要包含 title / content 两列。")
+                if uploaded_file is not None and st.sidebar.button("🚀 启动智能分析与导入"):
+                    import_bank_file(
+                        uploaded_file,
+                        table="reading_bank",
+                        field_map=READING_BANK_FIELDS,
+                        pdf_instruction=(
+                            "提取以下文本中适合英语朗读的段落或文章。\n"
+                            "请严格以 JSON 数组返回。每个元素包含两个键："
+                            '"title"（文章或段落的标题/概括）、"content"（具体的英文原文正文）。'
+                        ),
+                        label="阅读文章",
+                        clear_cache=clear_reading_bank_caches,
+                    )
+
             elif input_method == "✍️ 手动粘贴文本":
                 manual_title = st.sidebar.text_input("🏷️ 文章标题")
                 manual_content = st.sidebar.text_area("📝 文章正文", height=250)
@@ -969,7 +1383,7 @@ else:
                                 "content": manual_content.strip()
                             }).execute()
                         st.sidebar.success(f"✅ 《{manual_title}》已成功存入！")
-                        load_reading_bank.clear()
+                        clear_reading_bank_caches()
                     else:
                         st.sidebar.warning("⚠️ 标题和正文都不能为空哦！")
 
@@ -1012,7 +1426,7 @@ else:
                         except Exception as e:
                             st.sidebar.error(f"AI 识图失败：{e}")
 
-                st.sidebar.image(img_bytes, caption="题目预览", use_container_width=True)
+                st.sidebar.image(img_bytes, caption="题目预览", width="stretch")
 
                 if st.session_state.admin_writing_ready:
                     st.sidebar.text_input(
@@ -1068,7 +1482,7 @@ else:
             disabled=not danger_confirmed,
         ):
             supabase.table("question_bank").delete().neq("id", 0).execute()
-            load_question_bank.clear()
+            clear_question_bank_caches()
             st.sidebar.success("✅ 口语题库已清空！")
         if st.sidebar.button(
             "🚨 一键清空阅读文章",
@@ -1076,7 +1490,7 @@ else:
             disabled=not danger_confirmed,
         ):
             supabase.table("reading_bank").delete().neq("id", 0).execute()
-            load_reading_bank.clear()
+            clear_reading_bank_caches()
             st.sidebar.success("✅ 阅读文章库已清空！")
         if st.sidebar.button(
             "🚨 一键清空写作题库",
@@ -1094,9 +1508,9 @@ else:
         key="current_page",
     )
     if st.sidebar.button("🚪 退出登录"):
-        st.session_state.logged_in = False
-        st.session_state.current_user = ""
-        st.session_state.pop("requested_page", None)
+        # 必须整体清空：录音、作文草稿、批改结果都挂在 session_state 上，
+        # 只清 logged_in 的话，同一浏览器换账号登录会看到上一个人的数据。
+        st.session_state.clear()
         st.rerun()
 
     st.title("专属英语训练舱 🚀")
@@ -1137,12 +1551,9 @@ else:
             st.info(f"**考官提问：** {question}")
 
             past_records = load_practice_history(current_user, question)
-            if len(past_records) > 0:
-                with st.expander(f"📖 查看这道题的 {len(past_records)} 次历史点评记录"):
-                    for i, record in enumerate(past_records):
-                        st.markdown(f"**▶ 第 {i+1} 次练习：**")
-                        st.write(record["record_text"])
-                        st.write("---")
+            if past_records:
+                with st.expander(f"📖 查看这道题最近 {len(past_records)} 次点评记录"):
+                    render_history_records(past_records, "record_text")
 
             st.write("---")
             st.subheader("🗣️ Step 2: 你的回答")
@@ -1160,6 +1571,7 @@ else:
 
             qa_audio_key = f"audio_qa_{question}"
             qa_audio_hash_key = f"audio_hash_qa_{question}"
+            release_inactive_audio(qa_audio_key)
             if audio_bytes_qa:
                 st.session_state[qa_audio_key] = audio_bytes_qa
                 st.session_state[qa_audio_hash_key] = audio_fingerprint(audio_bytes_qa)
@@ -1221,11 +1633,13 @@ else:
                         st.session_state.pop(f"{qa_pending_key}_started_at", None)
                         status_box.update(label="本次录音评分完成", state="complete")
                         st.info("如需专属参考答案，请点击下方按钮生成。")
+                        # key 必须和「已评分」分支保持一致：点击后会 rerun 并切到那个分支，
+                        # key 不同的话按钮返回值会丢，用户得点两次才生效。
                         render_personalized_answer(
                             question,
                             current_user,
                             qa_answer_key,
-                            f"answer_qa_done_{question}_{st.session_state[qa_key_name]}",
+                            f"answer_qa_{question}_{st.session_state[qa_key_name]}",
                         )
                         
                     except Exception as e:
@@ -1255,6 +1669,183 @@ else:
                     st.session_state.pop(f"{qa_pending_key}_started_at", None)
                     st.session_state[qa_key_name] += 1
                     st.rerun()
+
+    # ==========================================
+    # 模块 1.5：我的素材朗读（用户自备素材 + 发音打分）
+    # ==========================================
+    elif page == "🎤 我的素材朗读":
+        st.subheader("🎤 我的素材朗读")
+        st.caption(
+            "把你自己准备的素材贴进来直接练。评分覆盖发音准确度、流利度、重音与语调，"
+            "并给出可切换口音和语速的示范朗读。"
+        )
+
+        if not speaking_tables_ready():
+            st.warning("素材库还没初始化 —— 需要先在数据库里建两张表（只需做一次）。")
+            st.markdown("打开 Supabase 控制台 → **SQL Editor** → 粘贴并运行下面的语句，然后刷新本页：")
+            st.code(SPEAKING_MATERIALS_SQL, language="sql")
+        else:
+            saved_msg = st.session_state.pop("material_saved_msg", "")
+            if saved_msg:
+                st.success(f"✅ 已存入素材库：{saved_msg}")
+
+            materials = load_speaking_materials(current_user)
+            temp_material = st.session_state.get("temp_material")
+
+            source_options = ["📚 我的素材库", "✍️ 贴一段新素材"]
+            # 和 requested_page 一样的套路：widget 的 key 一旦实例化就不能再改，
+            # 所以切换请求先存到另一个 key，在创建 radio 之前套用。
+            requested_source = st.session_state.pop("material_source_request", None)
+            if requested_source in source_options:
+                st.session_state.material_source = requested_source
+
+            default_source = 0 if materials and not temp_material else 1
+            source = st.radio(
+                "📥 素材来源：",
+                source_options,
+                index=default_source,
+                horizontal=True,
+                key="material_source",
+            )
+
+            active_title = ""
+            active_content = ""
+            active_scope = ""
+
+            if source == "✍️ 贴一段新素材":
+                # 必须用 form：st.text_area 的输入要等失焦或 ⌘+Enter 才会回传，
+                # 用普通按钮 + disabled 判断的话，按钮会一直是灰的，而灰按钮又接不到
+                # 那次「点击顺带让输入框失焦」的交互，用户就卡死了。
+                # form 的 submit 会把表单内所有控件的当前值一起提交。
+                with st.form("material_new_form"):
+                    new_content = st.text_area(
+                        "📝 粘贴英文素材正文",
+                        height=220,
+                        placeholder="把你素材库里的段落、范文或者想练的句子贴进来……",
+                    )
+                    new_title = st.text_input("🏷️ 素材标题（留空自动用正文开头命名）")
+                    col_try, col_save = st.columns(2)
+                    practice_only = col_try.form_submit_button(
+                        "▶️ 直接练（不保存）", width="stretch"
+                    )
+                    save_and_practice = col_save.form_submit_button(
+                        "💾 存入素材库并开始练", type="primary", width="stretch"
+                    )
+
+                trimmed = new_content.strip()
+                resolved_title = new_title.strip() or " ".join(trimmed.split()[:6])
+
+                if (practice_only or save_and_practice) and not trimmed:
+                    st.warning("⚠️ 请先粘贴素材正文再提交。")
+                elif practice_only:
+                    st.session_state.temp_material = {
+                        "title": resolved_title or "临时素材",
+                        "content": trimmed,
+                    }
+                    st.rerun()
+                elif save_and_practice:
+                    try:
+                        save_speaking_material(
+                            current_user, resolved_title or "未命名素材", trimmed
+                        )
+                    except Exception as e:
+                        st.error(f"保存失败：{e}")
+                    else:
+                        st.session_state.pop("temp_material", None)
+                        # 存完自动切回素材库，新素材排在最前面会被自动选中。
+                        st.session_state.material_source_request = "📚 我的素材库"
+                        st.session_state.material_saved_msg = resolved_title or "未命名素材"
+                        st.rerun()
+
+                if temp_material:
+                    st.info(f"当前正在练习临时素材：**{temp_material['title']}**（未保存）")
+                    active_title = temp_material["title"]
+                    active_content = temp_material["content"]
+                    active_scope = f"t{hashlib.md5(active_content.encode()).hexdigest()[:8]}"
+                    if st.button("🗑️ 结束这段临时素材"):
+                        st.session_state.pop("temp_material", None)
+                        st.rerun()
+
+            else:
+                if not materials:
+                    st.info("素材库还是空的。切到「✍️ 贴一段新素材」加一条吧。")
+                else:
+                    options = list(range(len(materials)))
+                    picked = st.selectbox(
+                        "📂 选择素材：",
+                        options,
+                        format_func=lambda i: (
+                            f"{materials[i]['title']}"
+                            f"（{count_words(materials[i]['content'])} 词）"
+                        ),
+                        key="material_pick",
+                    )
+                    chosen = materials[picked]
+                    active_title = chosen["title"]
+                    active_content = chosen["content"]
+                    active_scope = f"m{chosen['id']}"
+
+                    with st.expander("🗑️ 删除这条素材"):
+                        st.caption("删除后不可恢复，历史评分记录会保留。")
+                        if st.button("确认删除", key=f"del_material_{chosen['id']}"):
+                            delete_speaking_material(current_user, chosen["id"])
+                            st.success("已删除。")
+                            st.rerun()
+
+            if active_content:
+                st.markdown("---")
+                practice_mode = st.radio(
+                    "🎯 练习范围：",
+                    ["📖 整段连读", "🔍 逐句精读"],
+                    horizontal=True,
+                    key="material_mode",
+                )
+
+                if practice_mode == "📖 整段连读":
+                    target_text = active_content
+                    history_title = active_title
+                    scope_id = active_scope
+                    st.markdown(f"**请朗读以下内容：**\n> ### {target_text}")
+                else:
+                    sentences = split_sentences(active_content)
+                    sentence_idx = st.selectbox(
+                        "📍 选择要攻克的句子：",
+                        range(len(sentences)),
+                        format_func=lambda i: f"第 {i+1} 句: {sentences[i][:40]}...",
+                        key="material_sentence",
+                    )
+                    target_text = sentences[sentence_idx]
+                    history_title = f"{active_title} (第{sentence_idx+1}句)"
+                    scope_id = f"{active_scope}_s{sentence_idx}"
+                    st.markdown(
+                        f"**请朗读当前句子（第 {sentence_idx+1}/{len(sentences)} 句）：**"
+                        f"\n> ### {target_text}"
+                    )
+
+                st.markdown("---")
+                st.markdown("#### 🔊 先听示范")
+                render_tts_demo(target_text, key_prefix=f"material_tts_{scope_id}")
+
+                past_records = load_material_history(current_user, history_title)
+                if past_records:
+                    with st.expander(f"📖 查看这条素材最近 {len(past_records)} 次评分记录"):
+                        render_history_records(past_records, "record_text")
+
+                st.markdown("---")
+                st.markdown("#### 🎙️ 轮到你了")
+                render_recording_practice(
+                    scope_id=scope_id,
+                    audio_prefix="material",
+                    build_prompt=lambda: build_material_scoring_prompt(target_text),
+                    save_history=lambda report: save_material_history(
+                        current_user, history_title, report
+                    ),
+                    recorder_text="点击麦克风开始朗读",
+                    submit_label="📤 提交录音，开始发音打分",
+                    reset_label="🔄 读得不满意？清除录音重来",
+                    success_message="🎉 发音评分报告已生成！",
+                    celebrate=True,
+                )
 
     # ==========================================
     # 模块二：英文原版朗读纠音 (使用 client_voice 当教练)
@@ -1291,23 +1882,13 @@ else:
             
             if st.button("🎧 听专业播音员示范"):
                 with st.spinner("正在呼叫播音员..."):
-                    b64 = synthesize_tts_b64(target_text)
-                    md = f"""
-                        <audio controls autoplay style="width: 100%;">
-                        <source src="data:audio/mp3;base64,{b64}" type="audio/mp3">
-                        您的浏览器不支持音频播放。
-                        </audio>
-                        """
-                    st.markdown(md, unsafe_allow_html=True)
+                    st.audio(synthesize_tts_audio(target_text), format="audio/mp3", autoplay=True)
 
             past_reading_records = load_reading_history(current_user, db_save_title)
             
-            if len(past_reading_records) > 0:
-                with st.expander(f"📖 查看此项的 {len(past_reading_records)} 次历史纠音记录"):
-                    for i, record in enumerate(past_reading_records):
-                        st.markdown(f"**▶ 第 {i+1} 次跟读：**")
-                        st.write(record["record_text"])
-                        st.write("---")
+            if past_reading_records:
+                with st.expander(f"📖 查看此项最近 {len(past_reading_records)} 次纠音记录"):
+                    render_history_records(past_reading_records, "record_text")
 
             st.write("---")
             st.subheader("🎙️ 轮到你了")
@@ -1325,6 +1906,7 @@ else:
 
             reading_audio_key = f"audio_reading_{db_save_title}"
             reading_audio_hash_key = f"audio_hash_reading_{db_save_title}"
+            release_inactive_audio(reading_audio_key)
             if audio_bytes_reading:
                 st.session_state[reading_audio_key] = audio_bytes_reading
                 st.session_state[reading_audio_hash_key] = audio_fingerprint(audio_bytes_reading)
@@ -1457,16 +2039,12 @@ else:
 
             img_bytes = base64_to_image_bytes(selected_task.get("question_image"))
             if img_bytes:
-                st.image(img_bytes, caption="题目图表", use_container_width=True)
+                st.image(img_bytes, caption="题目图表", width="stretch")
 
             past_writing = load_writing_history(current_user, task_id)
             if past_writing:
-                with st.expander(f"📖 查看本题的 {len(past_writing)} 次历史批改"):
-                    for i, record in enumerate(past_writing):
-                        created = record.get("created_at", "")
-                        st.markdown(f"**▶ 第 {i + 1} 次** {created}")
-                        st.markdown(record["evaluation"])
-                        st.write("---")
+                with st.expander(f"📖 查看本题最近 {len(past_writing)} 次批改"):
+                    render_history_records(past_writing, "evaluation")
 
             st.write("---")
             st.subheader("✍️ Step 2: 开始写作")
@@ -1486,7 +2064,6 @@ else:
                 st.success(f"📏 当前字数：**{word_count}** / 建议 {word_target} 词（已达标 ✅）")
 
             is_task1 = writing_task_type == "Task 1"
-            unsafe_writing_markdown = not is_task1
             current_essay_hash = (
                 writing_fingerprint(task_id, user_essay)
                 if user_essay.strip()
@@ -1541,10 +2118,7 @@ else:
                     status_box.write("4/4 批改结果已归档。")
                     status_box.update(label="本次作文批改完成", state="complete")
                     st.success("🎉 批改完成！")
-                    render_writing_evaluation_result(
-                        evaluation,
-                        unsafe_allow_html=unsafe_writing_markdown,
-                    )
+                    render_writing_evaluation_result(evaluation)
                     st.balloons()
                 except Exception as e:
                     engine = "Gemini" if is_task1 else "DeepSeek"
@@ -1571,10 +2145,7 @@ else:
                         st.info("当前这版作文已经完成批改。修改草稿后可以再次提交。")
                     else:
                         st.warning("草稿已经修改。下方仍是上一次提交版本的批改结果。")
-                    render_writing_evaluation_result(
-                        stored_result,
-                        unsafe_allow_html=unsafe_writing_markdown,
-                    )
+                    render_writing_evaluation_result(stored_result)
 
                 submit_disabled = (
                     not user_essay.strip()
