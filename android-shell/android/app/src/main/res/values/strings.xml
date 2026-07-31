@@ -1,7 +1,0 @@
-<?xml version='1.0' encoding='utf-8'?>
-<resources>
-    <string name="app_name">IELTS Trainer</string>
-    <string name="title_activity_main">IELTS Trainer</string>
-    <string name="package_name">com.speakingpractice.trainer</string>
-    <string name="custom_url_scheme">com.speakingpractice.trainer</string>
-</resources>
