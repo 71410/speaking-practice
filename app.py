@@ -6,6 +6,7 @@ from supabase import create_client, Client
 import csv
 import json
 import re
+import requests
 from datetime import datetime, timedelta, timezone
 from gtts import gTTS
 import base64
@@ -20,6 +21,8 @@ GEMINI_API_KEY_VOICE = st.secrets["GEMINI_API_KEY_VOICE"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
 SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
+# 可选：配了才启用「客观测量」层，没配就退回纯 Gemini 评分。
+NVIDIA_API_KEY = st.secrets.get("NVIDIA_API_KEY", "")
 
 # 引擎 A：负责后台苦力（DeepSeek 文本解析）
 @st.cache_resource
@@ -288,6 +291,7 @@ def render_recording_practice(
     audio_prefix: str,
     build_prompt,
     save_history,
+    reference_text: str | None = None,
     recorder_text: str = "点击麦克风开始录音",
     submit_label: str = "📤 提交本次录音评分",
     reset_label: str = "🔄 清除录音，再录一次",
@@ -345,11 +349,32 @@ def render_recording_practice(
             st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
     elif st.session_state.get(pending_key):
         status_box = st.status("正在评分，报告会边生成边显示", expanded=True)
-        status_box.write(f"已收到提交（{st.session_state.get(started_key, '刚刚')}），正在发送录音给 Gemini……")
+        status_box.write(f"已收到提交（{st.session_state.get(started_key, '刚刚')}）")
         try:
+            # 第一步：客观测量。有原文 + 配了 NVIDIA key 才做。
+            measurements = None
+            if reference_text and NVIDIA_API_KEY:
+                status_box.write("正在做逐词比对（NVIDIA Parakeet ASR）……")
+                try:
+                    measurements = measure_reading(
+                        reference_text, transcribe_with_nvidia(saved_audio)
+                    )
+                except Exception as asr_error:
+                    # 测量失败不该挡住评分，退回纯 LLM 评分即可。
+                    status_box.write("逐词比对失败，本次只给 AI 主观点评。")
+                    st.info(f"客观测量这一步没跑通（{asr_error}），下面的报告是纯 AI 判断。")
+
+            if measurements:
+                st.markdown("#### 📐 客观测量（程序算出来的，不是 AI 听感）")
+                render_measurements(measurements)
+                st.markdown("#### 🎧 考官点评")
+
+            status_box.write("正在生成点评……")
             # 流式输出：1-2 秒就开始出字，不用盯着空白等一整轮。
             report = st.write_stream(
-                stream_gemini_content(contents=[wav_audio_part(saved_audio), build_prompt()])
+                stream_gemini_content(
+                    contents=[wav_audio_part(saved_audio), build_prompt(measurements)]
+                )
             )
             status_box.update(label="评分完成，正在归档", state="running")
             st.success(success_message)
@@ -1034,13 +1059,154 @@ def load_writing_history(username: str, task_id: int) -> list:
     return response.data or []
 
 
-def build_material_scoring_prompt(target_text: str) -> str:
+# ---------- 客观测量层（NVIDIA Parakeet ASR）----------
+#
+# 为什么需要这层：LLM 只是「听个大概然后写出一段听起来专业的文字」。实测把
+# 与原文完全一致的音频喂给 Gemini，它照样列出 6 处「错误」，而且「你读成」和
+# 「正确音标」两列是同一个字符串 —— 纯属为了填满表格而编。
+#
+# 我们这里有原文，所以漏读/多读/替换、语速、停顿这几项完全可以「算」出来。
+# 算出来的硬数字再交给 LLM 去组织语言，模型就没有空间瞎编了。
+#
+# 注意：该 REST 端点只返回 word/start/end，没有 confidence，所以
+# 「某个词发音含糊」这类判断仍然只能由 LLM 给，属于主观部分。
+NVIDIA_ASR_URL = (
+    "https://1598d209-5e27-4d3c-8079-4751568b1081.invocation.api.nvcf.nvidia.com"
+    "/v1/audio/transcriptions"
+)
+PAUSE_GAP_MS = 500  # 相邻词间隔超过这个值算一次明显停顿
+
+
+def transcribe_with_nvidia(wav_bytes: bytes, timeout: int = 90) -> dict:
+    """调用 Parakeet CTC 1.1B，返回 {'text': str, 'words': [{word,start,end}]}。"""
+    response = requests.post(
+        NVIDIA_ASR_URL,
+        headers={"Authorization": f"Bearer {NVIDIA_API_KEY}"},
+        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+        data={"language": "en-US", "word_time_offsets": "True"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+def normalize_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9']+", text.lower()) if w]
+
+
+def measure_reading(reference: str, asr: dict) -> dict:
+    """把 ASR 结果和原文比对，产出可验证的客观指标。"""
+    import difflib
+
+    ref_words = normalize_words(reference)
+    heard_words = normalize_words(asr.get("text", ""))
+    timed = asr.get("words") or []
+
+    substitutions: list[tuple[str, str]] = []
+    omissions: list[str] = []
+    insertions: list[str] = []
+    matched = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(
+        None, ref_words, heard_words
+    ).get_opcodes():
+        if tag == "equal":
+            matched += i2 - i1
+        elif tag == "replace":
+            substitutions.append((" ".join(ref_words[i1:i2]), " ".join(heard_words[j1:j2])))
+        elif tag == "delete":
+            omissions.append(" ".join(ref_words[i1:i2]))
+        elif tag == "insert":
+            insertions.append(" ".join(heard_words[j1:j2]))
+
+    # 时间戳单位是毫秒
+    speech_ms = (timed[-1]["end"] - timed[0]["start"]) if len(timed) >= 2 else 0
+    wpm = round(len(timed) / (speech_ms / 60000), 1) if speech_ms > 0 else None
+
+    pauses = []
+    for prev, nxt in zip(timed, timed[1:]):
+        gap = nxt["start"] - prev["end"]
+        if gap >= PAUSE_GAP_MS:
+            pauses.append({"after": prev["word"], "before": nxt["word"], "ms": gap})
+
+    return {
+        "heard_text": asr.get("text", "").strip(),
+        "reference_word_count": len(ref_words),
+        "coverage": round(100 * matched / len(ref_words), 1) if ref_words else 0.0,
+        "substitutions": substitutions,
+        "omissions": omissions,
+        "insertions": insertions,
+        "wpm": wpm,
+        "duration_s": round(speech_ms / 1000, 1) if speech_ms else None,
+        "pauses": pauses,
+    }
+
+
+def format_measurements_for_prompt(m: dict) -> str:
+    """把客观指标写成一段文本，注入 Prompt，作为 LLM 不许违背的事实。"""
+    lines = [
+        f"- ASR 实际转写：{m['heard_text']}",
+        f"- 原文词数 {m['reference_word_count']}，正确读出比例 {m['coverage']}%",
+        f"- 语速：{m['wpm']} 词/分钟（有效时长 {m['duration_s']} 秒）"
+        if m["wpm"] else "- 语速：无法测量",
+    ]
+    lines.append(
+        "- 读错的词：" + ("；".join(f"原文「{a}」读成了「{b}」" for a, b in m["substitutions"])
+                        if m["substitutions"] else "无")
+    )
+    lines.append("- 漏读：" + ("；".join(m["omissions"]) if m["omissions"] else "无"))
+    lines.append("- 多读：" + ("；".join(m["insertions"]) if m["insertions"] else "无"))
+    if m["pauses"]:
+        lines.append("- 明显停顿：" + "；".join(
+            f"「{p['after']}」之后停了 {p['ms']/1000:.1f} 秒" for p in m["pauses"][:8]))
+    else:
+        lines.append("- 明显停顿：无（没有超过 0.5 秒的间隔）")
+    return "\n".join(lines)
+
+
+def render_measurements(m: dict) -> None:
+    cols = st.columns(3)
+    cols[0].metric("正确读出", f"{m['coverage']}%")
+    cols[1].metric("语速", f"{m['wpm']} 词/分" if m["wpm"] else "—")
+    cols[2].metric("明显停顿", f"{len(m['pauses'])} 处")
+
+    if m["substitutions"] or m["omissions"] or m["insertions"]:
+        rows = []
+        for a, b in m["substitutions"]:
+            rows.append(f"| 读错 | `{a}` | `{b}` |")
+        for w in m["omissions"]:
+            rows.append(f"| 漏读 | `{w}` | — |")
+        for w in m["insertions"]:
+            rows.append(f"| 多读 | — | `{w}` |")
+        st.markdown(
+            "| 类型 | 原文 | 你读的 |\n|---|---|---|\n" + "\n".join(rows)
+        )
+    else:
+        st.success("逐词比对：没有读错、漏读或多读。")
+
+    with st.expander("查看 ASR 转写原文"):
+        st.write(m["heard_text"])
+
+
+def build_material_scoring_prompt(target_text: str, measurements: dict | None = None) -> str:
+    measured_block = ""
+    if measurements:
+        measured_block = f"""
+【已测量的客观事实 —— 这些是程序算出来的，不是听感，你必须以此为准】
+{format_measurements_for_prompt(measurements)}
+
+使用规则：
+- 上面的语速、漏读、多读、读错词已经确定，禁止推翻，也禁止再自行「听出」别的漏读或读错。
+- 如果上面写了「无」，就不要在报告里编造该类问题。
+- 你的价值在于上面测不出来的部分：具体音素发得准不准、重音位置、语调、连读弱读。
+- 停顿是否合理，请结合上面给出的真实停顿位置来评价。
+"""
+
     return f"""你是一名雅思口语考官，本次只评估 Pronunciation（发音）这一单项。考生正在朗读下面这段指定文本，我已上传他的录音。
 
 【指定文本】
 {target_text}
-
-请先把录音逐字与指定文本比对，再按雅思 Pronunciation 标准打分。所有分数用 0-9 分，允许 0.5 分档。
+{measured_block}
+请按雅思 Pronunciation 标准打分。所有分数用 0-9 分，允许 0.5 分档。
 
 严格按以下结构输出：
 
@@ -1896,7 +2062,8 @@ else:
                 render_recording_practice(
                     scope_id=scope_id,
                     audio_prefix="material",
-                    build_prompt=lambda: build_material_scoring_prompt(target_text),
+                    reference_text=target_text,
+                    build_prompt=lambda m=None: build_material_scoring_prompt(target_text, m),
                     save_history=lambda report: save_material_history(
                         current_user, history_title, report
                     ),

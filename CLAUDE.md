@@ -24,9 +24,31 @@ git push
 
 **单体 Streamlit 应用** (`app.py`，约 2170 行)。前端 UI 和后端逻辑都在同一个文件中，Streamlit 的 session state 管理所有交互状态。
 
-**双 AI 引擎**：
+**三个 AI 引擎**：
 - **DeepSeek**（OpenAI 兼容接口）：PDF 题目/文章提取、Task 2 写作批改、个性化参考答案
-- **Gemini**（Google genai SDK，模型常量 `GEMINI_FLASH_MODEL = "gemini-2.5-flash"`）：语音评分、Task 1 写作图片识题与批改
+- **Gemini**（Google genai SDK，模型常量 `GEMINI_FLASH_MODEL = "gemini-2.5-flash"`）：语音点评、Task 1 写作图片识题与批改
+- **NVIDIA Parakeet ASR**（REST，可选）：朗读的**客观测量**层，见下
+
+### 为什么要有客观测量层（重要）
+
+LLM 做发音评测是「听个大概然后写一段听起来专业的文字」。实测把**与原文完全一致**的
+音频喂给 Gemini，它照样列出 6 处「错误」，而且「你读成」和「正确音标」两列是同一个
+字符串 —— 纯粹为了填满表格而编。
+
+我们有原文，所以这些可以**算**出来：
+`transcribe_with_nvidia()` 取回转写 + 词级时间戳 → `measure_reading()` 做 diff，
+得到漏读/多读/读错词、覆盖率、语速（词/分钟）、停顿位置与时长。
+再由 `format_measurements_for_prompt()` 把这些硬数字注入 Prompt，明确禁止模型推翻。
+
+接地之后，同一段读对的音频，编造出来的「错误」从 6 条降到 **0** 条。
+
+边界：
+- 该 REST 端点只返回 `word/start/end`，**没有 confidence**（canary 与 parakeet-ctc-riva
+  也试过，拿不到）。所以「某个词发音含糊」仍然只能由 LLM 主观判断。
+- **音素级**（「你把 /θ/ 读成了 /s/」）拿不到，需要 NeMo Forced Aligner 自部署
+  或 Azure/Speechace 这类专门评测服务。
+- ASR 对口音鲁棒，会把读偏的词「纠正」回正确拼写，所以词级判断偏**宽松**，只能抓明显错误。
+- `NVIDIA_API_KEY` 没配时整层自动跳过，退回纯 Gemini 点评，不会报错。
 
 **数据库**：Supabase（云端 PostgreSQL）。注意 `SUPABASE_KEY` 是 **service_role**，RLS 被完全绕过，**每个查询都必须自己带 `.eq("username", ...)` 做隔离**。
 
