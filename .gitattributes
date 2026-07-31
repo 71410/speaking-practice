@@ -1,0 +1,7 @@
+# 统一换行符，避免同一文件里混用 CRLF/LF 导致 diff 里整篇文件都显示为已修改。
+*.py    text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
