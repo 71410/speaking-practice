@@ -56,6 +56,16 @@ NAV_PAGES = [
 # 新增录音模块时必须把前缀登记到这里，否则录音不会被回收。
 AUDIO_STATE_PREFIXES = ("audio_qa_", "audio_reading_", "audio_material_")
 
+# 录音器参数。
+# sample_rate：默认 44.1kHz 的未压缩 WAV，2 分钟就有 10 MB，光上传就要等很久；
+#   Gemini 处理语音本来就按 16kHz 来，降到 16kHz 只减体积不掉识别精度（约省 64%）。
+RECORDER_SAMPLE_RATE = 16000
+# pause_threshold：静音多少秒后自动停止录音。之前设成 60，意味着读完之后
+#   还要干等整整一分钟录音才结束 —— 这是「反馈慢」的最大来源。
+#   朗读时不会停顿 3 秒，所以朗读类用 3 秒；口语作答会边想边说，放宽到 8 秒。
+PAUSE_THRESHOLD_READING = 3.0
+PAUSE_THRESHOLD_SPEAKING = 8.0
+
 # gTTS 用 tld 切换口音。
 TTS_ACCENTS = {
     "🇬🇧 英式": "co.uk",
@@ -179,21 +189,66 @@ def is_gemini_quota_error(error: Exception) -> bool:
     return any(marker in message for marker in quota_markers)
 
 
+def gemini_config(thinking_budget: int | None):
+    """thinking_budget=0 关闭思考；None 表示交给模型动态决定（默认行为）。
+
+    实测：语音评分开着思考要烧 2800-4400 个思考 token（约 20 秒），
+    而这些 token 完全不体现在报告里 —— 关掉之后快 3.9 倍（30.3s → 7.8s），
+    输出反而更细（音标数 28 → 82）。所以除写作批改外一律关掉。
+    """
+    if thinking_budget is None:
+        return None
+    return genai_types.GenerateContentConfig(
+        thinking_config=genai_types.ThinkingConfig(thinking_budget=thinking_budget)
+    )
+
+
 def generate_gemini_content_with_retry(
     contents: list,
     model: str = GEMINI_FLASH_MODEL,
     retry_delays: tuple[int, ...] = (1, 2, 4),
+    thinking_budget: int | None = 0,
 ):
-    last_error = None
+    config = gemini_config(thinking_budget)
+    kwargs = {"config": config} if config else {}
     for attempt in range(len(retry_delays) + 1):
         try:
-            return client_voice.models.generate_content(model=model, contents=contents)
+            return client_voice.models.generate_content(
+                model=model, contents=contents, **kwargs
+            )
         except Exception as exc:
-            last_error = exc
             if attempt >= len(retry_delays) or not is_transient_gemini_error(exc):
                 raise
             time.sleep(retry_delays[attempt])
-    raise last_error
+
+
+def stream_gemini_content(
+    contents: list,
+    model: str = GEMINI_FLASH_MODEL,
+    retry_delays: tuple[int, ...] = (1, 2, 4),
+    thinking_budget: int | None = 0,
+):
+    """流式产出评分文本，让用户 1-2 秒就能看到内容，而不是干等一整轮。
+
+    只有「一个字都还没吐出来」时才重试；已经开始输出后再失败就直接抛，
+    否则重试会把前半段内容重复打印一遍。
+    """
+    config = gemini_config(thinking_budget)
+    kwargs = {"config": config} if config else {}
+    for attempt in range(len(retry_delays) + 1):
+        started = False
+        try:
+            for chunk in client_voice.models.generate_content_stream(
+                model=model, contents=contents, **kwargs
+            ):
+                if chunk.text:
+                    started = True
+                    yield chunk.text
+            return
+        except Exception as exc:
+            if started or attempt >= len(retry_delays) or not is_transient_gemini_error(exc):
+                raise
+            time.sleep(retry_delays[attempt])
 
 
 def show_gemini_busy_error(error: Exception) -> None:
@@ -238,6 +293,7 @@ def render_recording_practice(
     reset_label: str = "🔄 清除录音，再录一次",
     success_message: str = "🎉 评分完成！",
     celebrate: bool = False,
+    pause_threshold: float = PAUSE_THRESHOLD_READING,
 ) -> None:
     """录音 → 提交 → Gemini 评分 → 存档 的完整流程。
 
@@ -252,8 +308,12 @@ def render_recording_practice(
     audio_bytes = audio_recorder(
         text=recorder_text,
         icon_size="2x",
-        pause_threshold=60.0,
+        pause_threshold=pause_threshold,
+        sample_rate=RECORDER_SAMPLE_RATE,
         key=f"recorder_{audio_prefix}_{scope_id}_{gen}",
+    )
+    st.caption(
+        f"读完点一下麦克风就能立即结束；不点的话，静音满 {pause_threshold:.0f} 秒会自动停止。"
     )
 
     audio_key = f"audio_{audio_prefix}_{scope_id}"
@@ -284,27 +344,23 @@ def render_recording_practice(
         else:
             st.info("本次录音已完成评分。需要重新评分请先清除录音后再录一次。")
     elif st.session_state.get(pending_key):
-        st.success("录音已提交。")
-        status_box = st.status("正在处理本次录音评分，请勿刷新页面", expanded=True)
-        status_box.write(f"1/4 已收到提交。开始时间：{st.session_state.get(started_key, '刚刚')}")
-        status_box.write("2/4 正在发送录音给 Gemini。")
+        status_box = st.status("正在评分，报告会边生成边显示", expanded=True)
+        status_box.write(f"已收到提交（{st.session_state.get(started_key, '刚刚')}），正在发送录音给 Gemini……")
         try:
-            response = generate_gemini_content_with_retry(
-                contents=[wav_audio_part(saved_audio), build_prompt()]
+            # 流式输出：1-2 秒就开始出字，不用盯着空白等一整轮。
+            report = st.write_stream(
+                stream_gemini_content(contents=[wav_audio_part(saved_audio), build_prompt()])
             )
-            status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+            status_box.update(label="评分完成，正在归档", state="running")
             st.success(success_message)
-            st.markdown(response.text)
 
-            status_box.write("4/4 正在保存历史记录。")
             # 存档失败不应该让用户丢掉已经拿到的评分，所以单独捕获。
             try:
-                save_history(response.text)
+                save_history(report)
             except Exception as save_error:
-                status_box.write("历史记录保存失败，但本次评分结果仍然有效。")
                 st.warning(f"评分已生成，但历史记录没能存进数据库：{save_error}")
 
-            st.session_state[report_key] = response.text
+            st.session_state[report_key] = report
             st.session_state[tracker_key] = saved_hash
             st.session_state[pending_key] = False
             st.session_state.pop(started_key, None)
@@ -1083,7 +1139,8 @@ def evaluate_writing_task1_gemini(
             )
         )
     contents.append(prompt)
-    response = generate_gemini_content_with_retry(contents=contents)
+    # 写作批改是纯推理任务，这里保留动态思考（不像语音评分那样思考纯属浪费）。
+    response = generate_gemini_content_with_retry(contents=contents, thinking_budget=None)
     return response.text
 
 
@@ -1565,8 +1622,12 @@ else:
             audio_bytes_qa = audio_recorder(
                 text="点击麦克风开始作答",
                 icon_size="2x",
-                pause_threshold=60.0,
+                pause_threshold=PAUSE_THRESHOLD_SPEAKING,
+                sample_rate=RECORDER_SAMPLE_RATE,
                 key=f"recorder_qa_{question}_{st.session_state[qa_key_name]}"
+            )
+            st.caption(
+                f"答完点一下麦克风就能立即结束；不点的话，静音满 {PAUSE_THRESHOLD_SPEAKING:.0f} 秒会自动停止。"
             )
 
             qa_audio_key = f"audio_qa_{question}"
@@ -1602,8 +1663,7 @@ else:
                         expanded=True,
                     )
                     qa_started_at = st.session_state.get(f"{qa_pending_key}_started_at", "刚刚")
-                    status_box.write(f"1/4 已收到提交。开始时间：{qa_started_at}")
-                    status_box.write("2/4 正在发送录音给 Gemini。")
+                    status_box.write(f"已收到提交（{qa_started_at}），正在发送录音给 Gemini……")
                     try:
                         prompt = f"""
                         你现在是一名雅思口语考官。考生 {current_user} 正在回答题目：“{question}”。
@@ -1613,18 +1673,18 @@ else:
                         3. 【纠错与升级】：指出语法、词汇、逻辑上的具体问题，并给出可操作的改进方向（不要写完整示范答案，示范答案会单独生成）。
                         4. 【考官建议】：用中文给一段备考建议。
                         """
-                        response = generate_gemini_content_with_retry(
-                            contents=[wav_audio_part(saved_audio_qa), prompt]
+                        qa_report = st.write_stream(
+                            stream_gemini_content(
+                                contents=[wav_audio_part(saved_audio_qa), prompt]
+                            )
                         )
-                        status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+                        status_box.update(label="点评完成，正在归档", state="running")
                         st.success("🎉 考官点评完成！")
-                        st.markdown(response.text)
 
-                        status_box.write("4/4 正在保存历史记录。")
                         supabase.table("practice_history").insert({
                             "username": current_user,
                             "question": question,
-                            "record_text": response.text
+                            "record_text": qa_report
                         }).execute()
                         load_practice_history.clear()
 
@@ -1900,8 +1960,12 @@ else:
             audio_bytes_reading = audio_recorder(
                 text="点击录制你的朗读",
                 icon_size="2x",
-                pause_threshold=60.0,
+                pause_threshold=PAUSE_THRESHOLD_READING,
+                sample_rate=RECORDER_SAMPLE_RATE,
                 key=f"recorder_reading_{db_save_title}_{st.session_state[reading_key_name]}"
+            )
+            st.caption(
+                f"读完点一下麦克风就能立即结束；不点的话，静音满 {PAUSE_THRESHOLD_READING:.0f} 秒会自动停止。"
             )
 
             reading_audio_key = f"audio_reading_{db_save_title}"
@@ -1935,8 +1999,7 @@ else:
                         f"{reading_pending_key}_started_at",
                         "刚刚",
                     )
-                    status_box.write(f"1/4 已收到提交。开始时间：{reading_started_at}")
-                    status_box.write("2/4 正在发送录音给 Gemini。")
+                    status_box.write(f"已收到提交（{reading_started_at}），正在发送录音给 Gemini……")
                     try:
                         prompt = f"""
                         你现在是一名雅思口语考官兼流利度教练。考生正在朗读这段指定的文本：“{target_text}”
@@ -1948,19 +2011,19 @@ else:
                         3. 【语音语调（重音与连读）】：评价考生的意群断句（Chunking）、单词重音（Word Stress）和连读（Linking）是否自然。
                         4. 【考官提分建议】：给出一段犀利且实用的综合提升建议。
                         """
-                        response = generate_gemini_content_with_retry(
-                            contents=[wav_audio_part(saved_audio_reading), prompt]
+                        reading_report = st.write_stream(
+                            stream_gemini_content(
+                                contents=[wav_audio_part(saved_audio_reading), prompt]
+                            )
                         )
-                        status_box.write("3/4 Gemini 评分完成，正在展示结果。")
+                        status_box.update(label="评分完成，正在归档", state="running")
                         st.success("🎉 发音诊断报告已生成！")
-                        st.markdown(response.text)
                         st.balloons()
-                        
-                        status_box.write("4/4 正在保存历史记录。")
+
                         supabase.table("reading_history").insert({
                             "username": current_user,
                             "reading_title": db_save_title,
-                            "record_text": response.text
+                            "record_text": reading_report
                         }).execute()
                         load_reading_history.clear()
 
