@@ -606,6 +606,123 @@ def synthesize_tts_audio(text: str, tld: str = "co.uk", slow: bool = False) -> b
     return sound_file.getvalue()
 
 
+def render_selectable_reader(sentences: list[str], height: int = 460) -> None:
+    """可点读的材料：单击单词读该词，选中任意一段读选中内容。
+
+    这里用的是浏览器自带的 speechSynthesis，不是 gTTS。原因：
+    1. gTTS 无法从浏览器直接调用 —— 它走的是 Google 的 POST batchexecute 接口；
+       老的 translate_tts GET 端点会被 Google 挡掉（浏览器实测 NotSupportedError）。
+    2. 走服务端生成的话，gTTS 实测 2.25 秒/词、4 秒/句，还要叠加一次 Streamlit
+       rerun —— 跟「即时」正好相反。
+    speechSynthesis 完全在本地跑，点下去立刻出声，而且可以自由调语速、换口音。
+    整块是 components.html，所有交互都在 iframe 内完成，不会触发 rerun。
+    """
+    payload = json.dumps(sentences, ensure_ascii=False)
+    html = """
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  #bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+         padding:8px 10px; border-bottom:1px solid rgba(128,128,128,.3); font-size:13px; }
+  #bar label { opacity:.75 }
+  select,input[type=range]{ font-size:13px }
+  #doc { padding:14px 12px; line-height:2.1; font-size:19px; }
+  .sent { display:inline; }
+  .play { cursor:pointer; border:none; background:transparent; opacity:.35;
+          font-size:13px; padding:0 4px; }
+  .play:hover { opacity:1 }
+  .w { cursor:pointer; padding:1px 1px; border-radius:4px; }
+  .w:hover { background:rgba(255,170,0,.35) }
+  .on  { background:rgba(255,170,0,.75) !important; }
+  .sent.on { background:rgba(255,170,0,.22); border-radius:5px; }
+  #hint { padding:6px 12px; font-size:12px; opacity:.6 }
+</style>
+<div id="bar">
+  <label>口音</label><select id="voice"></select>
+  <label>语速</label><input id="rate" type="range" min="0.5" max="1.2" step="0.05" value="0.9">
+  <span id="rateval">0.9x</span>
+  <button id="stop">■ 停</button>
+</div>
+<div id="hint">单击任意单词 → 读该词；用光标选中一段 → 读选中内容；点句首 ▶ → 读整句。</div>
+<div id="doc"></div>
+<script>
+const SENTS = __PAYLOAD__;
+const $ = s => document.querySelector(s);
+const doc = $('#doc');
+
+SENTS.forEach((s, si) => {
+  const span = document.createElement('span');
+  span.className = 'sent'; span.dataset.i = si;
+  const btn = document.createElement('button');
+  btn.className = 'play'; btn.textContent = '▶'; btn.title = '朗读整句';
+  btn.onclick = e => { e.stopPropagation(); speak(s, span); };
+  span.appendChild(btn);
+  // 按空白切分，保留标点跟随单词，这样点击命中的是完整的词
+  s.split(/(\\s+)/).forEach(tok => {
+    if (!tok.trim()) { span.appendChild(document.createTextNode(tok)); return; }
+    const w = document.createElement('span');
+    w.className = 'w'; w.textContent = tok;
+    w.onclick = e => {
+      e.stopPropagation();
+      // 去掉首尾标点再读，避免把逗号句号也读出来
+      speak(tok.replace(/^[^A-Za-z']+|[^A-Za-z']+$/g, '') || tok, w);
+    };
+    span.appendChild(w);
+  });
+  doc.appendChild(span);
+  doc.appendChild(document.createTextNode('  '));
+});
+
+let voices = [], cur = null;
+function loadVoices() {
+  voices = speechSynthesis.getVoices().filter(v => v.lang.startsWith('en'));
+  if (!voices.length) return;
+  // 过滤掉 macOS 那些搞笑音色（Bells / Bubbles / Zarvox 之类）
+  const joke = /bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|albert|fred|junior|kathy|ralph/i;
+  const good = voices.filter(v => !joke.test(v.name));
+  if (good.length) voices = good;
+  const order = { 'en-GB': 0, 'en-US': 1, 'en-AU': 2 };
+  voices.sort((a, b) => (order[a.lang] ?? 9) - (order[b.lang] ?? 9) || a.name.localeCompare(b.name));
+  const sel = $('#voice');
+  sel.innerHTML = '';
+  voices.forEach((v, i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = v.name + '  (' + v.lang + ')';
+    sel.appendChild(o);
+  });
+  cur = voices[0];
+  sel.onchange = () => { cur = voices[+sel.value]; };
+}
+loadVoices();
+speechSynthesis.onvoiceschanged = loadVoices;
+
+$('#rate').oninput = e => $('#rateval').textContent = (+e.target.value).toFixed(2) + 'x';
+$('#stop').onclick = () => { speechSynthesis.cancel(); clearMark(); };
+
+function clearMark() { document.querySelectorAll('.on').forEach(n => n.classList.remove('on')); }
+
+function speak(text, node) {
+  if (!text || !text.trim()) return;
+  speechSynthesis.cancel();
+  clearMark();
+  if (node) node.classList.add('on');
+  const u = new SpeechSynthesisUtterance(text);
+  if (cur) { u.voice = cur; u.lang = cur.lang; }
+  u.rate = parseFloat($('#rate').value);
+  u.onend = u.onerror = () => { if (node) node.classList.remove('on'); };
+  speechSynthesis.speak(u);
+}
+
+// 选中一段就读选中的部分
+document.addEventListener('mouseup', () => {
+  const t = (window.getSelection().toString() || '').trim();
+  if (t.length > 1) speak(t, null);
+});
+</script>
+"""
+    st.components.v1.html(html.replace("__PAYLOAD__", payload), height=height, scrolling=True)
+
+
 def render_tts_demo(target_text: str, key_prefix: str) -> None:
     """示范朗读：可选口音与语速。音频按 (文本, 口音, 语速) 缓存 24 小时。"""
     col_accent, col_speed = st.columns([2, 1])
@@ -2027,13 +2144,14 @@ else:
                     key="material_mode",
                 )
 
+                sentences = split_sentences(active_content)
+
                 if practice_mode == "📖 整段连读":
                     target_text = active_content
                     history_title = active_title
                     scope_id = active_scope
-                    st.markdown(f"**请朗读以下内容：**\n> ### {target_text}")
+                    st.caption("下面整段都要读。想先弄清某个词或某句怎么念，直接点它就行。")
                 else:
-                    sentences = split_sentences(active_content)
                     sentence_idx = st.selectbox(
                         "📍 选择要攻克的句子：",
                         range(len(sentences)),
@@ -2043,14 +2161,14 @@ else:
                     target_text = sentences[sentence_idx]
                     history_title = f"{active_title} (第{sentence_idx+1}句)"
                     scope_id = f"{active_scope}_s{sentence_idx}"
-                    st.markdown(
-                        f"**请朗读当前句子（第 {sentence_idx+1}/{len(sentences)} 句）：**"
-                        f"\n> ### {target_text}"
-                    )
+                    st.caption(f"本次要读第 {sentence_idx+1}/{len(sentences)} 句（下方高亮那句）。")
 
-                st.markdown("---")
-                st.markdown("#### 🔊 先听示范")
-                render_tts_demo(target_text, key_prefix=f"material_tts_{scope_id}")
+                render_selectable_reader(
+                    sentences if practice_mode == "📖 整段连读" else [target_text]
+                )
+
+                with st.expander("🎧 听 gTTS 完整示范（本次要读的内容）"):
+                    render_tts_demo(target_text, key_prefix=f"material_tts_{scope_id}")
 
                 past_records = load_material_history(current_user, history_title)
                 if past_records:
@@ -2089,27 +2207,29 @@ else:
             practice_mode = st.radio("🎯 选择训练模式：", ["📖 全文连读", "🔍 逐句精读 (推荐)"], horizontal=True)
             st.write("---")
             
+            sentences = split_sentences(reading_text)
+
             if practice_mode == "📖 全文连读":
                 target_text = reading_text
                 db_save_title = reading_title
-                st.markdown(f"**请仔细朗读以下完整段落：**\n> ### {target_text}")
+                st.caption("下面整段都要读。想先弄清某个词或某句怎么念，直接点它就行。")
             else:
-                raw_sentences = re.split(r'(?<=[.!?])\s+', reading_text)
-                sentences = [s.strip() for s in raw_sentences if s.strip()]
-                if not sentences: sentences = [reading_text]
-                    
                 sentence_idx = st.selectbox(
-                    "📍 选择要攻克的句子：", 
-                    range(len(sentences)), 
-                    format_func=lambda x: f"第 {x+1} 句: {sentences[x][:40]}..."
+                    "📍 选择要攻克的句子：",
+                    range(len(sentences)),
+                    format_func=lambda x: f"第 {x+1} 句: {sentences[x][:40]}...",
                 )
                 target_text = sentences[sentence_idx]
                 db_save_title = f"{reading_title} (第{sentence_idx+1}句)"
-                st.markdown(f"**请仔细朗读当前句子（第 {sentence_idx+1}/{len(sentences)} 句）：**\n> ### {target_text}")
-            
-            if st.button("🎧 听专业播音员示范"):
-                with st.spinner("正在呼叫播音员..."):
-                    st.audio(synthesize_tts_audio(target_text), format="audio/mp3", autoplay=True)
+                st.caption(f"本次要读第 {sentence_idx+1}/{len(sentences)} 句（下方高亮那句）。")
+
+            # 点读区：单击单词读词、选中一段读该段，全部在浏览器本地完成，零延迟。
+            render_selectable_reader(
+                sentences if practice_mode == "📖 全文连读" else [target_text]
+            )
+
+            with st.expander("🎧 听 gTTS 完整示范（本次要读的内容）"):
+                render_tts_demo(target_text, key_prefix=f"reading_tts_{db_save_title}")
 
             past_reading_records = load_reading_history(current_user, db_save_title)
             
