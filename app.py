@@ -16,6 +16,56 @@ import time
 from openai import OpenAI
 import pypdf
 
+st.set_page_config(
+    page_title="英语训练舱",
+    page_icon="🎧",
+    layout="centered",          # 保持可读的窄栏，和 Claude 的阅读区一个思路
+    initial_sidebar_state="expanded",
+)
+
+# 配色在 .streamlit/config.toml 里（Streamlit 原生主题）。
+# 这里只补原生主题覆盖不到的排版细节，尽量少而精。
+# 只写 Streamlit 原生主题覆盖不到的排版细节。
+# 注意：Streamlit 的内部 class 名是哈希的（st-ae / st-af…），选择器一律用
+# data-testid，否则版本一升就失效。
+APP_CSS = """
+<style>
+  .block-container { padding-top: 2.4rem; padding-bottom: 4rem; max-width: 46rem; }
+
+  /* 标题层级更克制，接近 Claude 的排版节奏 */
+  h1 { font-size: 1.55rem !important; letter-spacing: -.01em; }
+  h2 { font-size: 1.2rem  !important; margin-top: .3rem !important; }
+  h3 { font-size: 1.02rem !important; }
+
+  hr { margin: 1.1rem 0; opacity: .45; }
+
+  /* 侧边栏导航：整行可点的条目感 */
+  section[data-testid="stSidebar"] div[role="radiogroup"] > label {
+      padding: .32rem .5rem; border-radius: .5rem; margin-bottom: .1rem;
+      transition: background .12s ease;
+  }
+  section[data-testid="stSidebar"] div[role="radiogroup"] > label:hover {
+      background: rgba(201,100,66,.10);
+  }
+
+  /* 表单/卡片容器留白舒展一点 */
+  div[data-testid="stForm"] { padding: 1rem 1.1rem; }
+  details[data-testid="stExpander"] summary { font-size: .92rem; }
+
+  /* 录音器居中，避免孤零零贴在左边 */
+  div[data-testid="stCustomComponentV1"] { margin: 0 auto; }
+</style>
+"""
+st.markdown(APP_CSS, unsafe_allow_html=True)
+
+
+def page_header(title: str, subtitle: str = "") -> None:
+    """统一的页面标题块，替代各页零散的 title/subheader/caption 组合。"""
+    st.markdown(f"### {title}")
+    if subtitle:
+        st.caption(subtitle)
+
+
 # --- 1. 🔑 核心配置区 (中西合璧：DeepSeek + Gemini) ---
 GEMINI_API_KEY_VOICE = st.secrets["GEMINI_API_KEY_VOICE"]
 DEEPSEEK_API_KEY = st.secrets["DEEPSEEK_API_KEY"]
@@ -547,8 +597,7 @@ def render_writing_evaluation_result(evaluation: str) -> None:
 
 
 def render_training_dashboard(current_user: str) -> None:
-    st.subheader("今天想练什么？")
-    st.caption("从一个模块开始就好。训练过程中录音、作文和批改结果都会尽量保留在当前会话里。")
+    page_header("今天想练什么？", "录音、作文和批改结果都会保留在当前会话里")
 
     # 首页只展示统计数字，用 count 查询即可，不必把整个题库和朗读原文拉下来。
     question_count = count_rows("question_bank")
@@ -563,37 +612,28 @@ def render_training_dashboard(current_user: str) -> None:
         else None
     )
 
-    col_speaking, col_material, col_reading, col_writing = st.columns(4)
+    day_count = len(load_day_timeline())
+    cards = [
+        ("🎧", "朗读跟读", f"Day1-7 共 {day_count} 段配套音频", "点句听原音", "📖 英文原版朗读纠音"),
+        ("🗣️", "模拟考官", f"题库 {question_count} 道题", "抽题作答，AI 打分", "🗣️ 模拟考官"),
+        ("🎤", "我的素材",
+         f"{material_count} 条" if material_count is not None else "待初始化",
+         "贴自己的素材练发音", "🎤 我的素材朗读"),
+        ("✍️", "写作批改", f"T1 {task1_count} 题 / T2 {task2_count} 题",
+         "按考官标准逐项批改", "✍️ 雅思写作练习"),
+    ]
 
-    with col_speaking:
-        st.markdown("#### 🗣️ 模拟考官")
-        st.caption(f"题库：{question_count} 道题")
-        if st.button("开始口语训练", type="primary", width="stretch"):
-            request_page_change("🗣️ 模拟考官")
+    for row in (cards[:2], cards[2:]):
+        for col, (icon, name, stat, desc, target) in zip(st.columns(2), row):
+            with col, st.container(border=True):
+                st.markdown(f"**{icon} {name}**")
+                st.caption(f"{stat}　·　{desc}")
+                if st.button("进入", key=f"go_{target}", width="stretch"):
+                    request_page_change(target)
 
-    with col_material:
-        st.markdown("#### 🎤 我的素材")
-        st.caption(
-            f"我的素材：{material_count} 条" if material_count is not None else "素材库待初始化"
-        )
-        if st.button("练自己的素材", type="primary", width="stretch"):
-            request_page_change("🎤 我的素材朗读")
-
-    with col_reading:
-        st.markdown("#### 📖 朗读纠音")
-        st.caption(f"材料：{reading_count} 篇")
-        if st.button("开始朗读训练", type="primary", width="stretch"):
-            request_page_change("📖 英文原版朗读纠音")
-
-    with col_writing:
-        st.markdown("#### ✍️ 写作批改")
-        st.caption(f"Task 1：{task1_count} 题｜Task 2：{task2_count} 题")
-        if st.button("开始写作练习", type="primary", width="stretch"):
-            request_page_change("✍️ 雅思写作练习")
-
-    st.markdown("---")
+    st.markdown("")
     profile_status = "已填写" if profile_filled else "未填写"
-    st.info(f"个人档案：{profile_status}。档案会用于生成更贴近你自己的口语参考答案。")
+    st.caption(f"个人档案：**{profile_status}**。档案用于生成更贴近你自己的口语参考答案。")
     if st.button("查看或修改个人档案"):
         request_page_change("👤 个人档案")
 
@@ -635,22 +675,40 @@ def render_audio_reader(entry: dict, height: int = 520) -> None:
     payload = json.dumps({"turns": entry["turns"], "url": audio_url}, ensure_ascii=False)
     html = """
 <style>
-  :root { color-scheme: light dark; }
-  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
-  #bar { position:sticky; top:0; z-index:5; backdrop-filter:blur(8px);
-         background:rgba(128,128,128,.10); padding:8px 10px; font-size:13px;
-         display:flex; gap:10px; align-items:center; flex-wrap:wrap;
-         border-bottom:1px solid rgba(128,128,128,.3); }
-  #doc { padding:10px 12px 30px; }
-  .turn { margin:0 0 10px; padding:7px 10px; border-radius:9px; line-height:1.85; }
-  .examiner { background:rgba(120,150,255,.13); }
-  .candidate { background:rgba(255,170,60,.13); }
-  .who { font-size:11px; opacity:.55; display:block; margin-bottom:2px; letter-spacing:.4px; }
-  .topic { font-size:12px; opacity:.7; margin:16px 0 6px; font-weight:600; }
-  .s { cursor:pointer; border-radius:4px; padding:1px 2px; }
-  .s:hover { background:rgba(255,170,0,.30); }
-  .s.on { background:rgba(255,170,0,.75); }
-  button { font-size:13px; cursor:pointer; }
+  /* 配色跟随 app 主题（Claude 暖白 + 陶土色），深浅色各一套 */
+  :root {
+    color-scheme: light dark;
+    --bg:#FAF9F7; --fg:#1F1E1D; --muted:#6B6862; --line:#E3E0D8;
+    --accent:#C96442; --ex-bg:#F0EEE7; --me-bg:#FBF0EA; --hit:rgba(201,100,66,.20);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#262624; --fg:#F0EEE6; --muted:#A8A49C; --line:#3E3E3C;
+            --accent:#D97757; --ex-bg:#2E2E2C; --me-bg:#3A2E29; --hit:rgba(217,119,87,.30); }
+  }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+  #bar { position:sticky; top:0; z-index:5; backdrop-filter:blur(10px);
+         background:color-mix(in srgb, var(--bg) 88%, transparent);
+         padding:9px 12px; font-size:13px; color:var(--muted);
+         display:flex; gap:12px; align-items:center; flex-wrap:wrap;
+         border-bottom:1px solid var(--line); }
+  #bar button, #bar select {
+      font-size:13px; cursor:pointer; color:var(--fg); background:var(--bg);
+      border:1px solid var(--line); border-radius:7px; padding:3px 9px; }
+  #bar button:hover { border-color:var(--accent); color:var(--accent); }
+  #doc { padding:12px 14px 34px; }
+  .turn { margin:0 0 9px; padding:9px 12px; border-radius:11px; line-height:1.9; }
+  .examiner { background:var(--ex-bg); }
+  .candidate { background:var(--me-bg); }
+  .who { font-size:10.5px; color:var(--muted); display:block; margin-bottom:3px;
+         letter-spacing:.7px; font-weight:600; }
+  .candidate .who { color:var(--accent); }
+  .topic { font-size:11.5px; color:var(--muted); margin:20px 0 8px; font-weight:600;
+           letter-spacing:.4px; text-transform:uppercase; }
+  .s { cursor:pointer; border-radius:5px; padding:1px 3px; margin:0 -1px;
+       transition:background .1s ease; }
+  .s:hover { background:var(--hit); }
+  .s.on { background:var(--accent); color:#fff; }
 </style>
 <div id="bar">
   <button id="stop">■ 停</button>
@@ -1766,9 +1824,13 @@ if "logged_in" not in st.session_state:
     st.session_state.current_user = ""
 
 if not st.session_state.logged_in:
-    st.title(" 高分英语训练舱 - 内部邀请版")
+    _, mid, _ = st.columns([1, 3, 1])
+    with mid:
+        st.markdown("<div style='height:8vh'></div>", unsafe_allow_html=True)
+        st.markdown("### 🎧 英语训练舱")
+        st.caption("内部邀请版")
     # 用 form 包起来，密码框里按回车即可提交（不必去点按钮）。
-    with st.form("login_form"):
+    with mid.form("login_form"):
         username = st.text_input("👤 账号")
         password = st.text_input("🔑 密码", type="password")
         submitted = st.form_submit_button("登录", type="primary")
@@ -1789,7 +1851,8 @@ else:
     if st.session_state.get("current_page") not in NAV_PAGES:
         st.session_state.current_page = "🏠 训练台"
 
-    st.sidebar.write(f"👤 当前练习者：**{current_user}**")
+    st.sidebar.markdown("### 🎧 英语训练舱")
+    st.sidebar.caption(f"练习者：**{current_user}**")
     
     # --- 👑 管理员后台 (DeepSeek 接管 PDF 解析) ---
     if current_user == "admin":
@@ -1977,7 +2040,6 @@ else:
         st.session_state.clear()
         st.rerun()
 
-    st.title("专属英语训练舱 🚀")
 
     # ==========================================
     # 个人档案
@@ -1986,7 +2048,7 @@ else:
         render_training_dashboard(current_user)
 
     elif page == "👤 个人档案":
-        st.subheader("👤 个人档案")
+        page_header("个人档案", "填了之后，专属参考答案会贴合你的真实背景")
         saved_info = load_profile_information(current_user)
         profile_text = st.text_area(
             "请输入你的个人背景、专业、爱好等",
@@ -2004,8 +2066,7 @@ else:
     # ==========================================
     elif page == "🗣️ 模拟考官":
         IELTS_BANK = load_question_bank()
-
-        st.subheader("📝 Step 1: 从题库中抽题")
+        page_header("模拟考官", "抽一道题，录音作答，拿到考官口吻的点评")
         if not IELTS_BANK:
             st.info("当前题库为空，请联系管理员在左侧上传题库。")
         else:
@@ -2141,11 +2202,8 @@ else:
     # 模块 1.5：我的素材朗读（用户自备素材 + 发音打分）
     # ==========================================
     elif page == "🎤 我的素材朗读":
-        st.subheader("🎤 我的素材朗读")
-        st.caption(
-            "把你自己准备的素材贴进来直接练。评分覆盖发音准确度、流利度、重音与语调，"
-            "并给出可切换口音和语速的示范朗读。"
-        )
+        page_header("我的素材朗读",
+                    "贴一段自己的素材，评分覆盖发音准确度、流利度、重音与语调")
 
         if not speaking_tables_ready():
             st.warning("素材库还没初始化 —— 需要先在数据库里建两张表（只需做一次）。")
@@ -2167,13 +2225,13 @@ else:
                 st.session_state.material_source = requested_source
 
             default_source = 0 if materials and not temp_material else 1
-            source = st.radio(
-                "📥 素材来源：",
+            source = st.segmented_control(
+                "素材来源",
                 source_options,
-                index=default_source,
-                horizontal=True,
+                default=source_options[default_source],
                 key="material_source",
-            )
+                label_visibility="collapsed",
+            ) or source_options[default_source]
 
             active_title = ""
             active_content = ""
@@ -2261,12 +2319,13 @@ else:
 
             if active_content:
                 st.markdown("---")
-                practice_mode = st.radio(
-                    "🎯 练习范围：",
+                practice_mode = st.segmented_control(
+                    "练习范围",
                     ["📖 整段连读", "🔍 逐句精读"],
-                    horizontal=True,
+                    default="📖 整段连读",
                     key="material_mode",
-                )
+                    label_visibility="collapsed",
+                ) or "📖 整段连读"
 
                 sentences = split_sentences(active_content)
 
@@ -2321,28 +2380,34 @@ else:
     # ==========================================
     elif page == "📖 英文原版朗读纠音":
         timeline = load_day_timeline()
-        source = st.radio(
-            "📚 材料来源：",
+        page_header("朗读跟读", "点句子听原音，挑一句录下来打分")
+
+        source = st.segmented_control(
+            "材料来源",
             ["🎧 Day1-7 配套音频", "📖 文章库"],
-            horizontal=True,
+            default="🎧 Day1-7 配套音频" if timeline else "📖 文章库",
             key="reading_source",
-            index=0 if timeline else 1,
+            label_visibility="collapsed",
         )
 
         if source == "🎧 Day1-7 配套音频":
             if not timeline:
                 st.error(f"没找到时间轴数据（{DAY_TIMELINE_PATH}），无法加载配套音频。")
             else:
-                col_d, col_p = st.columns(2)
-                day = col_d.selectbox(
-                    "📅 选择 Day：", sorted({v["day"] for v in timeline.values()}), key="day_pick"
-                )
-                part = col_p.selectbox(
-                    "📂 选择 Part：",
-                    sorted({v["part"] for v in timeline.values() if v["day"] == day}),
-                    format_func=lambda p: f"Part {p}",
-                    key="day_part_pick",
-                )
+                days = sorted({v["day"] for v in timeline.values()})
+                col_d, col_p = st.columns([3, 2])
+                with col_d:
+                    day = st.segmented_control(
+                        "Day", days, default=days[0], key="day_pick",
+                        format_func=lambda d: f"D{d}",
+                    ) or days[0]
+                with col_p:
+                    parts = sorted({v["part"] for v in timeline.values() if v["day"] == day})
+                    part = st.segmented_control(
+                        "Part", parts, default=parts[0], key="day_part_pick",
+                        format_func=lambda p: f"P{p}",
+                    ) or parts[0]
+
                 entry = timeline.get(f"day{day}-part{part}")
                 if not entry:
                     st.warning("这一组还没有配套音频。")
@@ -2352,21 +2417,21 @@ else:
                         for ti, t in enumerate(entry["turns"]) if t["w"] == "c"
                         for si, s in enumerate(t["s"]) if s[1] is not None
                     ]
-                    st.caption(
-                        f"全文 {entry['duration']/60:.1f} 分钟 · "
-                        f"{sum(len(t['s']) for t in entry['turns'])} 句可点 · "
-                        f"**点任意句子就播放那一句的真实录音**（支持单句循环）"
-                    )
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("时长", f"{entry['duration']/60:.1f} 分")
+                    m2.metric("可点句子", sum(len(t["s"]) for t in entry["turns"]))
+                    m3.metric("你的答句", len(answers))
                     render_audio_reader(entry)
 
-                    st.write("---")
-                    st.subheader("🎙️ 挑一句来练")
-                    st.caption("选中的这句会用于录音评分。评分时会自动和原文逐词比对。")
+                    st.markdown("---")
+                    st.markdown("#### 🎙️ 挑一句来练")
+                    st.caption("选中的这句会用于录音评分，评分时自动与原文逐词比对。")
                     pick = st.selectbox(
-                        "📍 选择要练的答句：",
+                        "选择要练的答句",
                         range(len(answers)),
                         format_func=lambda i: f"{answers[i][2][0][:70]}",
                         key=f"day_sent_{day}_{part}",
+                        label_visibility="collapsed",
                     )
                     target_text = answers[pick][2][0]
                     db_save_title = f"Day{day} Part{part} · {target_text[:40]}"
@@ -2403,7 +2468,11 @@ else:
             reading_title = st.selectbox("📂 选择朗读材料：", list(READING_MATERIALS.keys()), key="sel_reading")
             reading_text = READING_MATERIALS[reading_title]
             
-            practice_mode = st.radio("🎯 选择训练模式：", ["📖 全文连读", "🔍 逐句精读 (推荐)"], horizontal=True)
+            practice_mode = st.segmented_control(
+                "训练模式", ["📖 全文连读", "🔍 逐句精读"],
+                default="🔍 逐句精读", key="article_mode",
+                label_visibility="collapsed",
+            ) or "🔍 逐句精读"
             st.write("---")
             
             sentences = split_sentences(reading_text)
@@ -2549,7 +2618,7 @@ else:
     # 模块三：雅思写作练习 (Gemini 多模态批改)
     # ==========================================
     elif page == "✍️ 雅思写作练习":
-        st.subheader("📝 Step 1: 选择题目")
+        page_header("写作批改", "按雅思四项标准逐条批改，附逐句精批")
         writing_task_type = st.selectbox(
             "📋 选择题型：",
             ["Task 1", "Task 2"],
