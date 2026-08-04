@@ -606,6 +606,130 @@ def synthesize_tts_audio(text: str, tld: str = "co.uk", slow: bool = False) -> b
     return sound_file.getvalue()
 
 
+DAY_AUDIO_BASE = f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/public/day-audio"
+DAY_TIMELINE_PATH = "data/day_timeline.json"
+
+
+@st.cache_data(show_spinner=False)
+def load_day_timeline() -> dict:
+    """Day1-7 配套音频的句子级时间轴。
+
+    音频本身没留下分段信息，这份时间轴是用 Parakeet ASR 的词级时间戳
+    与 docx 原文做 diff 对齐重建出来的（词匹配率 96.6%-99.5%），
+    离线算好后随仓库走，运行时不需要再调 ASR。
+    """
+    try:
+        with open(DAY_TIMELINE_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+
+
+def render_audio_reader(entry: dict, height: int = 520) -> None:
+    """点句子就播那一段真实录音。
+
+    整块是 components.html：音频元素和高亮都在 iframe 内，点击不触发 rerun，
+    所以切句子是瞬时的，也不会打断正在播放的音频。
+    """
+    audio_url = f"{DAY_AUDIO_BASE}/{entry['audio']}"
+    payload = json.dumps({"turns": entry["turns"], "url": audio_url}, ensure_ascii=False)
+    html = """
+<style>
+  :root { color-scheme: light dark; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  #bar { position:sticky; top:0; z-index:5; backdrop-filter:blur(8px);
+         background:rgba(128,128,128,.10); padding:8px 10px; font-size:13px;
+         display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+         border-bottom:1px solid rgba(128,128,128,.3); }
+  #doc { padding:10px 12px 30px; }
+  .turn { margin:0 0 10px; padding:7px 10px; border-radius:9px; line-height:1.85; }
+  .examiner { background:rgba(120,150,255,.13); }
+  .candidate { background:rgba(255,170,60,.13); }
+  .who { font-size:11px; opacity:.55; display:block; margin-bottom:2px; letter-spacing:.4px; }
+  .topic { font-size:12px; opacity:.7; margin:16px 0 6px; font-weight:600; }
+  .s { cursor:pointer; border-radius:4px; padding:1px 2px; }
+  .s:hover { background:rgba(255,170,0,.30); }
+  .s.on { background:rgba(255,170,0,.75); }
+  button { font-size:13px; cursor:pointer; }
+</style>
+<div id="bar">
+  <button id="stop">■ 停</button>
+  <label>速度</label>
+  <select id="rate">
+    <option value="0.75">0.75x</option><option value="0.9">0.9x</option>
+    <option value="1" selected>1.0x</option><option value="1.25">1.25x</option>
+  </select>
+  <label><input type="checkbox" id="loop"> 单句循环</label>
+  <span id="now" style="opacity:.65"></span>
+</div>
+<div id="doc"></div>
+<script>
+const DATA = __PAYLOAD__;
+const audio = new Audio(DATA.url);
+audio.preload = "metadata";
+const doc = document.getElementById('doc');
+const nowEl = document.getElementById('now');
+let cur = null, stopAt = null;
+
+let lastTopic = null;
+DATA.turns.forEach(t => {
+  if (t.tp && t.tp !== lastTopic) {
+    const h = document.createElement('div');
+    h.className = 'topic'; h.textContent = '— ' + t.tp + ' —';
+    doc.appendChild(h); lastTopic = t.tp;
+  }
+  const box = document.createElement('div');
+  box.className = 'turn ' + (t.w === 'e' ? 'examiner' : 'candidate');
+  const who = document.createElement('span');
+  who.className = 'who'; who.textContent = t.w === 'e' ? 'EXAMINER' : 'YOU';
+  box.appendChild(who);
+  t.s.forEach(([text, st, en]) => {
+    const sp = document.createElement('span');
+    sp.className = 's'; sp.textContent = text + ' ';
+    if (st !== null) {
+      sp.dataset.st = st; sp.dataset.en = en;
+      sp.onclick = () => play(sp);
+    } else { sp.style.opacity = .5; sp.style.cursor = 'default'; }
+    box.appendChild(sp);
+  });
+  doc.appendChild(box);
+});
+
+function play(el) {
+  if (cur) cur.classList.remove('on');
+  cur = el; el.classList.add('on');
+  stopAt = parseFloat(el.dataset.en);
+  audio.playbackRate = parseFloat(document.getElementById('rate').value);
+  audio.currentTime = parseFloat(el.dataset.st);
+  audio.play();
+  el.scrollIntoView({block:'center', behavior:'smooth'});
+}
+
+audio.ontimeupdate = () => {
+  nowEl.textContent = audio.paused ? '' : audio.currentTime.toFixed(1) + 's';
+  if (stopAt !== null && audio.currentTime >= stopAt) {
+    if (document.getElementById('loop').checked && cur) {
+      audio.currentTime = parseFloat(cur.dataset.st);
+    } else {
+      audio.pause();
+      stopAt = null;
+      if (cur) cur.classList.remove('on');
+      nowEl.textContent = '';
+    }
+  }
+};
+audio.onerror = () => { nowEl.textContent = '音频加载失败'; };
+document.getElementById('stop').onclick = () => {
+  audio.pause(); stopAt = null;
+  if (cur) cur.classList.remove('on');
+  nowEl.textContent = '';
+};
+document.getElementById('rate').onchange = e => audio.playbackRate = parseFloat(e.target.value);
+</script>
+"""
+    st.components.v1.html(html.replace("__PAYLOAD__", payload), height=height, scrolling=True)
+
+
 def render_selectable_reader(sentences: list[str], height: int = 460) -> None:
     """可点读的材料：单击单词读该词，选中任意一段读选中内容。
 
@@ -2196,11 +2320,86 @@ else:
     # 模块二：英文原版朗读纠音 (使用 client_voice 当教练)
     # ==========================================
     elif page == "📖 英文原版朗读纠音":
-        READING_MATERIALS = load_reading_bank()
-        
-        if not READING_MATERIALS:
+        timeline = load_day_timeline()
+        source = st.radio(
+            "📚 材料来源：",
+            ["🎧 Day1-7 配套音频", "📖 文章库"],
+            horizontal=True,
+            key="reading_source",
+            index=0 if timeline else 1,
+        )
+
+        if source == "🎧 Day1-7 配套音频":
+            if not timeline:
+                st.error(f"没找到时间轴数据（{DAY_TIMELINE_PATH}），无法加载配套音频。")
+            else:
+                col_d, col_p = st.columns(2)
+                day = col_d.selectbox(
+                    "📅 选择 Day：", sorted({v["day"] for v in timeline.values()}), key="day_pick"
+                )
+                part = col_p.selectbox(
+                    "📂 选择 Part：",
+                    sorted({v["part"] for v in timeline.values() if v["day"] == day}),
+                    format_func=lambda p: f"Part {p}",
+                    key="day_part_pick",
+                )
+                entry = timeline.get(f"day{day}-part{part}")
+                if not entry:
+                    st.warning("这一组还没有配套音频。")
+                else:
+                    answers = [
+                        (ti, si, s)
+                        for ti, t in enumerate(entry["turns"]) if t["w"] == "c"
+                        for si, s in enumerate(t["s"]) if s[1] is not None
+                    ]
+                    st.caption(
+                        f"全文 {entry['duration']/60:.1f} 分钟 · "
+                        f"{sum(len(t['s']) for t in entry['turns'])} 句可点 · "
+                        f"**点任意句子就播放那一句的真实录音**（支持单句循环）"
+                    )
+                    render_audio_reader(entry)
+
+                    st.write("---")
+                    st.subheader("🎙️ 挑一句来练")
+                    st.caption("选中的这句会用于录音评分。评分时会自动和原文逐词比对。")
+                    pick = st.selectbox(
+                        "📍 选择要练的答句：",
+                        range(len(answers)),
+                        format_func=lambda i: f"{answers[i][2][0][:70]}",
+                        key=f"day_sent_{day}_{part}",
+                    )
+                    target_text = answers[pick][2][0]
+                    db_save_title = f"Day{day} Part{part} · {target_text[:40]}"
+
+                    past = load_reading_history(current_user, db_save_title)
+                    if past:
+                        with st.expander(f"📖 查看这句最近 {len(past)} 次纠音记录"):
+                            render_history_records(past, "record_text")
+
+                    render_recording_practice(
+                        scope_id=f"day{day}p{part}s{pick}",
+                        audio_prefix="reading",
+                        reference_text=target_text,
+                        build_prompt=lambda m=None: build_material_scoring_prompt(target_text, m),
+                        save_history=lambda report: (
+                            supabase.table("reading_history").insert({
+                                "username": current_user,
+                                "reading_title": db_save_title,
+                                "record_text": report,
+                            }).execute(),
+                            load_reading_history.clear(),
+                        ),
+                        recorder_text="点击录制你的朗读",
+                        submit_label="📤 提交录音，开始发音打分",
+                        reset_label="🔄 读得不满意？清除录音重来",
+                        success_message="🎉 发音评分报告已生成！",
+                        celebrate=True,
+                    )
+
+        elif not load_reading_bank():
             st.info("当前阅读库为空。请用 admin 账号在左侧侧边栏上传或粘贴文本。")
         else:
+            READING_MATERIALS = load_reading_bank()
             reading_title = st.selectbox("📂 选择朗读材料：", list(READING_MATERIALS.keys()), key="sel_reading")
             reading_text = READING_MATERIALS[reading_title]
             

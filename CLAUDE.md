@@ -54,7 +54,7 @@ LLM 做发音评测是「听个大概然后写一段听起来专业的文字」�
 
 | 表 | 用途 |
 |----|------|
-| `question_bank` | 口语题库（part, theme, question_text） |
+| `question_bank` | 口语题库（part, theme, question_text）。**已超过 1000 行**，务必走 `fetch_all_rows()` |
 | `reading_bank` | 朗读材料库（title, content），admin 上传，全站共用 |
 | `writing_bank` | 写作题库（task_type, title, content, question_image 存 base64） |
 | `speaking_materials` | **按用户隔离**的个人素材库（username, title, content） |
@@ -62,6 +62,22 @@ LLM 做发音评测是「听个大概然后写一段听起来专业的文字」�
 | `profiles` | 用户个人档案 |
 
 **用户认证**：简单的账号密码登录（`secrets.toml` 的 `[passwords]` 段），admin 账号有题库管理权限。
+
+### Day1-7 配套音频（朗读纠音模块）
+
+21 个 Magpie 合成的对话音频（约 100 MB）存在 Supabase Storage 的 **`day-audio`** public bucket，
+URL 形如 `{SUPABASE_URL}/storage/v1/object/public/day-audio/day1-part1.mp3`。
+
+句子级时间轴在 **`data/day_timeline.json`**（165 KB，随仓库走，运行时不查库也不调 ASR）。
+点一句就播那一句靠的是它，`render_audio_reader()` 直接 seek 到 `start` 并在 `end` 停。
+
+这份时间轴是**离线重建**出来的：音频当初逐段合成后拼接，中间过程没留 manifest，
+所以用 Parakeet ASR 取词级时间戳，再和 docx 原文做 difflib 对齐反推每句的起止
+（词匹配率 96.6%-99.5%，闭环抽查切片重新转写吻合度 100%）。
+重建脚本不在本仓库，源文档改了需要重跑对齐。
+
+坑：**每一天的主题标题都不一样**（Day1 是 `Work or studies`，Day2 是 `Hobby`……），
+引导语分散在源目录各个 `generate_*.py` 里，不要写死白名单。
 
 ## 性能：缓存层（重要）
 
